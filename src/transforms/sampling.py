@@ -770,29 +770,39 @@ class SampleSegments(Transform):
             num_keep = num_nodes - int(num_nodes * ratio[i_level - 1])
 
             # Initialize all segments with the same weights
-            weights = torch.ones(num_nodes, device=device)
+        weights = torch.ones(num_nodes, device=device)
 
-            # Compute per-segment weights solely based on the segment
-            # size. This is biased towards preserving large segments in
-            # the sampling
-            if self.by_size:
-                node_size = nag.get_sub_size(i_level, low=0)
-                size_weights = node_size ** 0.333
-                size_weights /= size_weights.sum()
-                weights += size_weights
+        # Compute per-segment weights solely based on the segment
+        # size. This is biased towards preserving large segments in
+        # the sampling
+        if self.by_size:
+            node_size = nag.get_sub_size(i_level, low=0)
+            size_weights = node_size ** 0.333
+            size_weights /= size_weights.sum()
+            
+            # Ensure weights and size_weights are on the same device
+            if weights.device != size_weights.device:
+                size_weights = size_weights.to(weights.device)
+                
+            weights += size_weights
 
-            # Compute per-class weights based on class frequencies in
-            # the current NAG and give a weight to each segment
-            # based on the rarest class it contains. This is biased
-            # towards sampling rare classes
-            if self.by_class and nag[i_level].y is not None:
-                counts = nag[i_level].y.sum(dim=0).sqrt()
-                scores = 1 / (counts + 1)
-                scores /= scores.sum()
-                mask = nag[i_level].y.gt(0)
-                class_weights = (mask * scores.view(1, -1)).max(dim=1).values
-                class_weights /= class_weights.sum()
-                weights += class_weights.squeeze()
+        # Compute per-class weights based on class frequencies in
+        # the current NAG and give a weight to each segment
+        # based on the rarest class it contains. This is biased
+        # towards sampling rare classes
+        if self.by_class and nag[i_level].y is not None:
+            counts = nag[i_level].y.sum(dim=0).sqrt()
+            scores = 1 / (counts + 1)
+            scores /= scores.sum()
+            mask = nag[i_level].y.gt(0)
+            class_weights = (mask * scores.view(1, -1)).max(dim=1).values
+            class_weights /= class_weights.sum()
+            
+            # Ensure weights and class_weights are on the same device
+            if weights.device != class_weights.device:
+                class_weights = class_weights.to(weights.device)
+                
+            weights += class_weights.squeeze()
 
             # Normalize the weights again, in case size or class weights
             # were added
@@ -950,6 +960,12 @@ class BaseSampleSubgraphs(Transform):
 
                 # Compute the sampling indices for the NAG at hand
                 mask = torch.where(i_batch == batch)[0]
+                
+                # Ensure mask and weights are on the same device
+                weights_device = weights.device
+                if mask.device != weights_device:
+                    mask = mask.to(weights_device)
+                
                 idx_ = torch.multinomial(
                     weights[mask], k_batch, replacement=False)
                 idx_list.append(mask[idx_])
@@ -1192,7 +1208,7 @@ class SampleRadiusSubgraphs(BaseSampleSubgraphs):
         batch_query = batch[idx_seed] if batch is not None else None
 
         # Prepare the inputs for the neighborhood search
-        mask = torch.tensor([[1, 1, not self.cylindrical]], device=nag.device)
+        mask = torch.tensor([[1, 1, not self.cylindrical]], device=nag[i_level].pos.device)
         pos_search = nag[i_level].pos * mask
         pos_query = nag[i_level].pos[idx_seed] * mask
 

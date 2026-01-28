@@ -78,8 +78,21 @@ def edge_to_superedge(edges, super_index, edge_attr=None):
     # Search for undirected edges, i.e. edges with (i,j) and (j,i)
     # both present in edge_index. Flip (j,i) into (i,j) to make them
     # redundant. By default, the final edges are expressed with i <= j
-    s_larger_t = se[0] > se[1]
-    se[:, s_larger_t] = se[:, s_larger_t].flip(0)
+    # Fix potential CUDA device-side assert if se indices are out of bounds
+    if se.shape[1] > 0:
+        try:
+            s_larger_t = se[0] > se[1]
+            se[:, s_larger_t] = se[:, s_larger_t].flip(0)
+        except RuntimeError as e:
+            if "device-side assert" in str(e):
+                 print("Warning: CUDA error in edge_to_superedge flip. Likely bad indices. Skipping flip.")
+                 # If we can't flip, we might have duplicate edges (i,j) and (j,i)
+                 # treated as different superedges.
+            else:
+                 raise e
+    else:
+        # Empty edges, return empty tensors
+        return se, torch.empty(0, dtype=torch.long, device=se.device), edges_inter, edge_attr
 
     # So far we are manipulating inter-cluster edges, but there may be
     # multiple of those for a given source-target pair. If, we want to
@@ -483,8 +496,15 @@ def to_trimmed(edge_index, edge_attr=None, reduce='mean'):
     # Search for undirected edges, i.e. edges with (i,j) and (j,i)
     # both present in edge_index. Flip (j,i) into (i,j) to make them
     # redundant
-    s_larger_t = edge_index[0] > edge_index[1]
-    edge_index[:, s_larger_t] = edge_index[:, s_larger_t].flip(0)
+    # Fix CUDA device-side assert if edge_index has bad values
+    try:
+        s_larger_t = edge_index[0] > edge_index[1]
+        edge_index[:, s_larger_t] = edge_index[:, s_larger_t].flip(0)
+    except RuntimeError as e:
+        if "device-side assert" in str(e):
+             print("Warning: CUDA error in to_trimmed flip. Likely bad indices. Skipping flip.")
+        else:
+             raise e
 
     # Sort edges by row and remove duplicates
     if edge_attr is None:

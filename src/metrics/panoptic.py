@@ -122,7 +122,8 @@ class PanopticQuality3D(Metric):
             compute_on_cpu: bool = False,
             **kwargs: Any
     ) -> None:
-        super().__init__(compute_on_cpu=compute_on_cpu, **kwargs)
+        self._compute_on_cpu = compute_on_cpu
+        super().__init__(**kwargs)
 
         # Store the number of valid classes in the dataset
         self.num_classes = num_classes

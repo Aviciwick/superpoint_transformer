@@ -2,7 +2,25 @@ import os
 import torch
 import logging
 import numpy as np
-from torchmetrics.classification import MulticlassConfusionMatrix
+try:
+    from torchmetrics.classification import MulticlassConfusionMatrix
+except Exception:
+    # Minimal fallback to accumulate confusion matrix
+    class MulticlassConfusionMatrix(torch.nn.Module):
+        def __init__(self, num_classes, **kwargs):
+            super().__init__()
+            self.num_classes = num_classes
+            self.confmat = torch.zeros((num_classes, num_classes), dtype=torch.long)
+        def update(self, pred, target):
+            if pred.dim() == 2:
+                pred = pred.argmax(dim=1)
+            if target.dim() == 2 and target.shape[1] == 1:
+                target = target.squeeze()
+            for p, t in zip(pred.view(-1), target.view(-1)):
+                if 0 <= t < self.num_classes:
+                    self.confmat[p, t] += 1
+        def compute(self):
+            return self.confmat
 from torch_scatter import scatter_sum
 from src.metrics.mean_average_precision import BaseMetricResults
 

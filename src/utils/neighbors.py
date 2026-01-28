@@ -2,7 +2,10 @@ import torch
 from time import time
 
 import src
-from src.dependencies.FRNN import frnn
+try:
+    from src.dependencies.FRNN import frnn as _frnn
+except Exception:
+    _frnn = None
 from torch_scatter import scatter
 from torch_geometric.utils import coalesce
 from src.utils.scatter import scatter_nearest_neighbor
@@ -44,8 +47,101 @@ def _frnn_grid_points(xyz_query, xyz_search, K=1, r=1):
     else:
         K = torch.tensor([K], device=device)
 
-    # Run the actual FRNN search
-    return frnn.frnn_grid_points(xyz_query, xyz_search, K=K, r=r)
+    # Run the actual FRNN search if available; otherwise fallback to brute force
+    if _frnn is not None:
+        return _frnn.frnn_grid_points(xyz_query, xyz_search, K=K, r=r)
+    else:
+        xq = xyz_query[0]
+        xs = xyz_search[0]
+        
+        # Use scikit-learn's NearestNeighbors for CPU-based KNN if available and efficient
+        # This is generally much more memory efficient than brute-force distance matrix
+        if xq.numel() * xs.numel() * 4 > 1024 * 1024 * 64: # > 64MB roughly, prefer KDTree
+            try:
+                from sklearn.neighbors import NearestNeighbors
+                # Move to CPU numpy
+                xq_np = xq.detach().cpu().numpy()
+                xs_np = xs.detach().cpu().numpy()
+                
+                Kval = int(K[0].item()) if isinstance(K, torch.Tensor) else int(K)
+                
+                # Fit and query
+                nbrs = NearestNeighbors(n_neighbors=Kval, algorithm='auto', n_jobs=-1).fit(xs_np)
+                dists, indices = nbrs.kneighbors(xq_np)
+                
+                # Convert back to torch
+                d_top = torch.from_numpy(dists).to(device).float().unsqueeze(0)
+                idx_top = torch.from_numpy(indices).to(device).long().unsqueeze(0)
+                
+                # Apply radius mask
+                mask = d_top > r
+                d_top[mask] = -1
+                idx_top[mask] = -1
+                
+                return d_top, idx_top, None, None
+            except ImportError:
+                print("Warning: scikit-learn not found, falling back to slow/memory-intensive brute force.")
+            except Exception as e:
+                print(f"Warning: sklearn KNN failed ({e}), falling back to brute force.")
+
+        # Brute force distances with chunking to avoid OOM
+        # Force CPU execution to avoid CUDA OOM if data is large
+        # Also limit max memory for CPU to avoid System OOM (137)
+        force_cpu = False
+        if xq.numel() * xs.numel() * 4 > 1024 * 1024 * 128: # > 128MB roughly
+             xq = xq.cpu()
+             xs = xs.cpu()
+             force_cpu = True
+        
+        B = 256 # Even smaller chunk size
+        if force_cpu:
+            B = 1024 # Larger chunks on CPU to avoid overhead
+            
+        N = xq.shape[0]
+        Kval = int(K[0].item()) if isinstance(K, torch.Tensor) else int(K)
+        dist_chunks = []
+        idx_chunks = []
+        
+        # Ensure K is within bounds
+        Kval = min(Kval, xs.shape[0])
+        
+        for start in range(0, N, B):
+            end = min(start + B, N)
+            cq = xq[start:end]
+            # Use cdist if available and efficient? No, explicit broadcast is fine
+            # but chunking xs might be needed too if xs is HUGE
+            
+            dists = (xs.unsqueeze(0) - cq.unsqueeze(1)).norm(dim=2)
+            # dists shape: [B, N_search]
+            
+            # If N_search is very large, sorting is slow. topk is faster.
+            if dists.shape[1] > Kval:
+                d_top_c, idx_top_c = dists.topk(Kval, dim=1, largest=False, sorted=True)
+            else:
+                d_sorted, idx_sorted = dists.sort(dim=1)
+                d_top_c = d_sorted[:, :Kval]
+                idx_top_c = idx_sorted[:, :Kval]
+                
+            dist_chunks.append(d_top_c)
+            idx_chunks.append(idx_top_c)
+            
+        d_sorted = torch.cat(dist_chunks, dim=0)
+        idx_sorted = torch.cat(idx_chunks, dim=0)
+        
+        # Move back to original device if needed
+        if d_sorted.device != device:
+            d_sorted = d_sorted.to(device)
+            idx_sorted = idx_sorted.to(device)
+            
+        # Apply radius mask
+        mask = d_sorted > r
+        d_sorted[mask] = -1
+        idx_sorted[mask] = -1
+        # Keep top-K
+        d_top = d_sorted[:, :Kval].unsqueeze(0)
+        idx_top = idx_sorted[:, :Kval].unsqueeze(0)
+        # Placeholders to mimic FRNN API
+        return d_top, idx_top, None, None
 
 
 def knn_1(
@@ -541,6 +637,9 @@ def cluster_radius_nn_graph(
     # Roughly estimate the diameter and center of each segment. Note we
     # do not use the centroid (center of mass) but rather the center of
     # the bounding box
+    # Ensure idx is on the same device as x_points
+    if idx.device != x_points.device:
+        idx = idx.to(x_points.device)
     bbox_low = scatter(x_points, idx, dim=0, reduce='min')
     bbox_high = scatter(x_points, idx, dim=0, reduce='max')
     diam = (bbox_high - bbox_low).max(dim=1).values

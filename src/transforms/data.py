@@ -87,7 +87,8 @@ class Cast(Transform):
         cast = lambda x: cast_tensor(
             x, fp_dtype=self.fp_dtype, int_dtype=self.int_dtype, optimal_int_dtype=self.optimal_int_dtype)
 
-        for k in data.keys:
+        keys = data.keys() if callable(data.keys) else data.keys
+        for k in keys:
 
             # Specific behavior for casting 'rgb' and 'mean_rgb'
             # attributes
@@ -168,7 +169,7 @@ class RemoveKeys(Transform):
         self.strict = strict
 
     def _process(self, data):
-        keys = set(data.keys)
+        keys = set(data.keys() if callable(data.keys) else data.keys)
         for k in self.keys:
             if k not in keys and self.strict:
                 raise Exception(f"key: {k} is not within Data keys: {keys}")

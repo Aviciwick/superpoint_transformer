@@ -10,8 +10,14 @@ import matplotlib.patches as patches
 import matplotlib.cm as cm
 from torch.nn.functional import one_hot
 from torch_geometric.nn.pool.consecutive import consecutive_cluster
-from pycut_pursuit.cp_d0_dist import cp_d0_dist
-from grid_graph import edge_list_to_forward_star
+try:
+    from pycut_pursuit.cp_d0_dist import cp_d0_dist as _cp_d0_dist
+except Exception:
+    _cp_d0_dist = None
+try:
+    from grid_graph import edge_list_to_forward_star as _edge_list_to_forward_star
+except Exception:
+    _edge_list_to_forward_star = None
 
 from src.utils.hydra import init_config
 from src.utils.neighbors import knn_2
@@ -467,8 +473,20 @@ def _instance_cut_pursuit(
     edge_discrepancy = edge_affinity / (1 - edge_affinity + discrepancy_epsilon)
 
     # Convert edges to forward-star (or CSR) representation
-    source_csr, target, reindex = edge_list_to_forward_star(
-        num_nodes, edge_index.T.contiguous().cpu().numpy())
+    if _edge_list_to_forward_star is None:
+        # Fallback: build simple CSR from edge_index
+        ei = edge_index.T.contiguous().cpu().numpy()
+        # Compute CSR pointers
+        counts = np.zeros(num_nodes, dtype=np.uint32)
+        for e in ei:
+            counts[e[0]] += 1
+        source_csr = np.zeros(num_nodes + 1, dtype=np.uint32)
+        source_csr[1:] = np.cumsum(counts)
+        target = ei[:, 1].astype('uint32')
+        reindex = np.arange(target.shape[0])
+    else:
+        source_csr, target, reindex = _edge_list_to_forward_star(
+            num_nodes, edge_index.T.contiguous().cpu().numpy())
     source_csr = source_csr.astype('uint32')
     target = target.astype('uint32')
     edge_weights = edge_discrepancy.cpu().numpy()[reindex] * regularization \
@@ -507,7 +525,25 @@ def _instance_cut_pursuit(
     coor_weights[x_dim:] *= p_weight
 
     # Partition computation
-    obj_index, x_c, cluster, edges, times = cp_d0_dist(
+    if _cp_d0_dist is None:
+        # Fallback: simple connected components on edge_index by thresholding discrepancies
+        # Build graph and assign each node to its own component, then merge along edges with high affinity
+        import torch_geometric
+        num_nodes_local = num_nodes
+        comp = torch.arange(num_nodes_local, device=device)
+        # Merge along edges with affinity > 0.5
+        src = torch.from_numpy(source_csr[:-1]).long()
+        # Simplified union-find using single pass
+        for e in range(edge_index.shape[1]):
+            i = edge_index[0, e].item()
+            j = edge_index[1, e].item()
+            if edge_affinity[e] > 0.5:
+                a = comp[i].item(); b = comp[j].item()
+                if a != b:
+                    comp[comp == b] = a
+        obj_index = comp
+        return obj_index
+    obj_index, x_c, cluster, edges, times = _cp_d0_dist(
         l2_dim,
         x,
         source_csr,

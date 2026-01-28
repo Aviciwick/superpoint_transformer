@@ -327,6 +327,8 @@ class InstanceData(CSRData):
         obj_idx = self.obj[perm]
 
         # Expand per-cluster positions to each overlap
+        if a_idx.device != cluster_pos.device:
+            a_idx = a_idx.to(cluster_pos.device)
         a_pos = cluster_pos[a_idx]
 
         # Compute the weight for each overlap
@@ -341,11 +343,22 @@ class InstanceData(CSRData):
             w = self.count
         else:
             raise NotImplementedError
+        
+        # Ensure w is on the same device as a_pos
+        if w.device != a_pos.device:
+            w = w.to(a_pos.device)
+            
         w = w.view(-1, 1)
 
         # To avoid running 2 scatter operations, we concatenate the data
         # we want to sum before
+        
         a_wpos = torch.cat((a_pos * w, w), dim=1)
+        
+        # Ensure b_idx is on the same device as a_wpos
+        if b_idx.device != a_wpos.device:
+            b_idx = b_idx.to(a_wpos.device)
+            
         res = scatter_sum(a_wpos, b_idx, dim=0)
         obj_pos = res[:, :-1] / res[:, -1].view(-1, 1)
 

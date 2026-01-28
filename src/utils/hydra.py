@@ -1,4 +1,4 @@
-import pyrootutils
+import os
 from hydra import initialize, compose
 from hydra.core.global_hydra import GlobalHydra
 
@@ -15,7 +15,12 @@ def init_config(config_name='train.yaml', overrides=[]):
         OmegaConf.register_new_resolver('eval', eval)
 
     GlobalHydra.instance().clear()
-    pyrootutils.setup_root(".", pythonpath=True)
-    with initialize(version_base='1.2', config_path="../../configs"):
-        cfg = compose(config_name=config_name, overrides=overrides)
+    # Ensure CWD is this utils directory so relative config_path works
+    cwd_bckp = os.getcwd()
+    os.chdir(os.path.dirname(__file__))
+    try:
+        with initialize(config_path="../../configs"):
+            cfg = compose(config_name=config_name, overrides=overrides)
+    finally:
+        os.chdir(cwd_bckp)
     return cfg

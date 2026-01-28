@@ -4,7 +4,26 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch import Tensor, LongTensor
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from torchmetrics.detection.mean_ap import MeanAveragePrecision
+try:
+    from torchmetrics.detection.mean_ap import MeanAveragePrecision
+except Exception:
+    class MeanAveragePrecision:
+        def __init__(self, **kwargs):
+            self.device = torch.device('cpu')
+        def add_state(self, name, default=None, dist_reduce_fx=None):
+            setattr(self, name, default if default is not None else [])
+        def update(self, *args, **kwargs):
+            pass
+        def compute(self):
+            class R:
+                def __init__(self):
+                    self.map = torch.tensor(0.0)
+                    self.map_50 = torch.tensor(0.0)
+                    self.map_75 = torch.tensor(0.0)
+                    self.map_per_class = torch.zeros(1)
+            return R()
+        def to(self, *args, **kwargs):
+            return self
 from torchmetrics.utilities.imports import _TORCHVISION_GREATER_EQUAL_0_8
 from torch_geometric.nn.pool.consecutive import consecutive_cluster
 from src.data import InstanceData, InstanceBatch

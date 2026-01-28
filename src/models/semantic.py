@@ -4,7 +4,7 @@ import os.path as osp
 from torch.nn import ModuleList
 import logging
 from copy import deepcopy
-from typing import List, Tuple, Dict, Union
+from typing import List, Tuple, Dict, Union, Any
 from pytorch_lightning import LightningModule
 from torchmetrics import MaxMetric, MeanMetric, SumMetric, CatMetric
 from pytorch_lightning.loggers.wandb import WandbLogger
@@ -132,7 +132,7 @@ class SemanticSegmentationModule(LightningModule):
             net: torch.nn.Module,
             criterion: 'torch.nn._Loss',
             optimizer: torch.optim.Optimizer,
-            scheduler: torch.optim.lr_scheduler.LRScheduler,
+            scheduler: Any,
             num_classes: int,
             class_names: List[str] = None,
             sampling_loss: bool = False,
@@ -1424,7 +1424,7 @@ class PartitionAndSemanticModule(SemanticSegmentationModule):
             net: torch.nn.Module,
             criterion: 'torch.nn._Loss',
             optimizer: torch.optim.Optimizer,
-            scheduler: torch.optim.lr_scheduler.LRScheduler,
+            scheduler: Any,
             num_classes: int,
             class_names: List[str] = None,
             sampling_loss: bool = False,

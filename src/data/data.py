@@ -159,8 +159,9 @@ class Data(PyGData):
         """All keys starting with `edge_`, apart from `edge_index` and
         `edge_attr`.
         """
+        keys = self.keys() if callable(self.keys) else self.keys
         return [
-            k for k in self.keys
+            k for k in keys
             if k.startswith('edge_') and k not in ['edge_index', 'edge_attr']]
 
     def raise_if_edge_keys(self):
@@ -177,7 +178,8 @@ class Data(PyGData):
     @property
     def v_edge_keys(self) -> List[str]:
         """All keys starting with `v_edge_`."""
-        return [k for k in self.keys if k.startswith('v_edge_')]
+        keys = self.keys() if callable(self.keys) else self.keys
+        return [k for k in keys if isinstance(k, str) and k.startswith('v_edge_')]
 
     @property
     def num_points(self):
@@ -436,8 +438,8 @@ class Data(PyGData):
                 continue
 
             is_tensor = torch.is_tensor(item)
-            is_node_size = item.shape[0] == self.num_nodes
-            is_edge_size = item.shape[0] == self.num_edges
+            is_node_size = is_tensor and item.shape[0] == self.num_nodes
+            is_edge_size = is_tensor and self.has_edges and item.shape[0] == self.num_edges
 
             # Slice tensor elements containing num_edges elements. Note
             # we deal with edges first, to rule out the case where
@@ -1141,7 +1143,7 @@ class Data(PyGData):
         setattr(self, to, torch.cat(feat_list, dim=1))
 
 
-class Batch(PyGBatch, Data):
+class Batch(PyGBatch):
     """Inherit from torch_geometric.Batch with extensions tailored to
     our specific needs.
 

@@ -102,7 +102,7 @@ non_blocking: True
 pre_transform:
     - transform: DataTo
       params:
-        device: 'cuda'
+        device: 'cpu'
     - transform: SaveNodeIndex
       params:
         key: 'sub'
@@ -173,6 +173,7 @@ pre_transform:
         se_ratio: ${datamodule.graph_se_ratio}
         se_min: ${datamodule.graph_se_min}
         cycles: ${datamodule.graph_cycles}
+        pca_on_cpu: True
         margin: ${datamodule.graph_margin}
         chunk_size: ${datamodule.graph_chunk}
         halfspace_filter: True

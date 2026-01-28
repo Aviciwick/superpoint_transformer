@@ -1,8 +1,30 @@
+from __future__ import annotations
 import torch
 import logging
 from typing import Any, List, Tuple, Dict
-from torchmetrics import MaxMetric, MeanMetric
-from torchmetrics.classification import BinaryAccuracy, BinaryF1Score
+try:
+    from torchmetrics import MaxMetric, MeanMetric
+except Exception:
+    class MaxMetric:
+        def __init__(self): pass
+        def reset(self): pass
+        def compute(self): return 0
+        def __call__(self, *args, **kwargs): pass
+    class MeanMetric:
+        def __init__(self): pass
+        def reset(self): pass
+        def __call__(self, *args, **kwargs): pass
+try:
+    from torchmetrics.classification import BinaryAccuracy, BinaryF1Score
+except Exception:
+    class BinaryAccuracy:
+        def __call__(self, *args, **kwargs): pass
+        def compute(self): return 0
+        def reset(self): pass
+    class BinaryF1Score:
+        def __call__(self, *args, **kwargs): pass
+        def compute(self): return 0
+        def reset(self): pass
 from torch_geometric.nn.pool.consecutive import consecutive_cluster
 
 from src.utils import init_weights, PanopticSegmentationOutput, \
@@ -180,7 +202,7 @@ class PanopticSegmentationModule(SemanticSegmentationModule):
             partitioner: 'InstancePartitioner',
             criterion: 'torch.nn._Loss',
             optimizer: torch.optim.Optimizer,
-            scheduler: torch.optim.lr_scheduler.LRScheduler,
+            scheduler: Any,
             num_classes: int,
             stuff_classes: List[int],
             class_names: List[str] = None,

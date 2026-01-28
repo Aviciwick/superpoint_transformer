@@ -79,12 +79,21 @@ class RandomTiltAndRotate(Transform):
 
         # Compute the rotation matrix
         R = rodrigues_rotation_matrix(axis, theta)
+        
+        # Ensure R is on the correct device
+        if R.device != device:
+            R = R.to(device)
 
         # Rotate the nodes at each level. If the nodes have a `normal`
         # attribute, we also rotate those accordingly
         for i_level in nag.level_range:
             if sigma <= 0:
                 continue
+            
+            # Ensure nag[i_level].pos is on the same device as R
+            if nag[i_level].pos.device != R.device:
+                nag[i_level].pos = nag[i_level].pos.to(R.device)
+                
             nag[i_level].pos = nag[i_level].pos @ R.T
 
             # If the nodes have a `normal` or 'mean_normal' attribute,
@@ -102,6 +111,9 @@ class RandomTiltAndRotate(Transform):
                     "Expected exactly 7 features in `edge_attr`, generated " \
                     "with `_minimalistic_horizontal_edge_features`"
                 dtype = edge_attr.dtype
+                # Ensure edge_attr is on the same device as R
+                if edge_attr.device != R.device:
+                    edge_attr = edge_attr.to(R.device)
                 edge_attr[:, :3] = (edge_attr[:, :3].float() @ R.T).to(dtype)  # `mean_off`, float16 mm not supported on CPU
                 nag[i_level].edge_attr = edge_attr
 
@@ -110,6 +122,9 @@ class RandomTiltAndRotate(Transform):
     @staticmethod
     def _rotate_normal(normal, R):
         dtype = normal.dtype
+        # Ensure normal is on the same device as R
+        if normal.device != R.device:
+            normal = normal.to(R.device)
         normal = (normal.float() @ R.T).to(dtype)
         normal[normal[:, 2] < 0] *= -1
         return normal

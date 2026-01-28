@@ -773,8 +773,8 @@ class SPT(nn.Module):
                             keys=self.point_hf, 
                             to='x', 
                             delete_after=False)
-            
-            nag.add_keys_to(level=0, 
+        
+        nag.add_keys_to(level='1+', 
                             keys=self.post_cnn_point_hf, 
                             to='x_mlp', 
                             delete_after=not self.store_features)
@@ -820,14 +820,36 @@ class SPT(nn.Module):
                 # level
                 i_level = i_stage + 1 + self.nano
 
+                # Ensure all tensors are on the correct device
+                # This handles the case where DataModule/Batch creation leaves tensors on CPU
+                try:
+                    target_device = next(self.parameters()).device
+                except StopIteration:
+                    target_device = torch.device('cpu')
+                
+                if hasattr(nag[i_level], 'x') and nag[i_level].x is not None and nag[i_level].x.device != target_device:
+                    nag[i_level].x = nag[i_level].x.to(target_device)
+                if hasattr(nag[i_level], 'pos') and nag[i_level].pos is not None and nag[i_level].pos.device != target_device:
+                    nag[i_level].pos = nag[i_level].pos.to(target_device)
+                if hasattr(nag[i_level], 'edge_index') and nag[i_level].edge_index is not None and nag[i_level].edge_index.device != target_device:
+                    nag[i_level].edge_index = nag[i_level].edge_index.to(target_device)
+                if hasattr(nag[i_level], 'edge_attr') and nag[i_level].edge_attr is not None and nag[i_level].edge_attr.device != target_device:
+                    nag[i_level].edge_attr = nag[i_level].edge_attr.to(target_device)
+                if hasattr(nag[i_level], 'v_edge_attr') and nag[i_level].v_edge_attr is not None and nag[i_level].v_edge_attr.device != target_device:
+                    nag[i_level].v_edge_attr = nag[i_level].v_edge_attr.to(target_device)
+
                 # Process handcrafted node and edge features. We need to
                 # do this here before those can be passed to the
                 # DownNFuseStage and, later on, to the UpNFuseStage
                 if node_mlp is not None:
                     norm_index = nag[i_level].norm_index(mode=self.norm_mode)
+                    if norm_index is not None and norm_index.device != target_device:
+                        norm_index = norm_index.to(target_device)
                     nag[i_level].x = node_mlp(nag[i_level].x, batch=norm_index)
                 if h_edge_mlp is not None:
                     norm_index = nag[i_level].norm_index(mode=self.norm_mode)
+                    if norm_index is not None and norm_index.device != target_device:
+                        norm_index = norm_index.to(target_device)
                     norm_index = norm_index[nag[i_level].edge_index[0]]
                     edge_attr = getattr(nag[i_level], 'edge_attr', None)
                     if edge_attr is not None:
@@ -835,6 +857,8 @@ class SPT(nn.Module):
                             edge_attr, batch=norm_index)
                 if v_edge_mlp is not None:
                     norm_index = nag[i_level - 1].norm_index(mode=self.norm_mode)
+                    if norm_index is not None and norm_index.device != target_device:
+                        norm_index = norm_index.to(target_device)
                     v_edge_attr = getattr(nag[i_level], 'v_edge_attr', None)
                     if v_edge_attr is not None:
                         nag[i_level - 1].v_edge_attr = v_edge_mlp(

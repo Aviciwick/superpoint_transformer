@@ -500,7 +500,8 @@ class S3DIS(BaseDataset):
         # Unzip the file and rename it into the `root/raw/` directory. This
         # directory contains the raw Area folders from the zip
         extract_zip(osp.join(self.root, self._zip_name), self.root)
-        shutil.rmtree(self.raw_dir)
+        if osp.exists(self.raw_dir):
+            shutil.rmtree(self.raw_dir)
         os.rename(osp.join(self.root, self._unzip_name), self.raw_dir)
 
     def read_single_raw_cloud(self, raw_cloud_path: str) -> 'Data':

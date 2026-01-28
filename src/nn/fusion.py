@@ -38,6 +38,9 @@ class BaseFusion(nn.Module):
 
 class CatFusion(BaseFusion):
     def _func(self, x1, x2):
+        # Ensure x1 and x2 are on the same device
+        if x1.device != x2.device:
+            x2 = x2.to(x1.device)
         return torch.cat((x1, x2), dim=1)
 
 

@@ -247,6 +247,9 @@ class Stage(nn.Module):
 
         # Append normalized coordinates to the node features
         if pos is not None:
+            # Ensure pos is on the same device as x
+            if pos.device != x.device:
+                pos = pos.to(x.device)
             normalized_pos, diameter_parent = self.pos_norm(pos, super_index, w=node_size)
             if self.use_pos:
                 x = self.feature_fusion(normalized_pos, x)
@@ -266,11 +269,17 @@ class Stage(nn.Module):
             elif super_index is None:
                 diam = diameter_parent.repeat(N, 1)
             else:
+                # Ensure super_index is on the same device as diameter_parent
+                if super_index.device != diameter_parent.device:
+                    super_index = super_index.to(diameter_parent.device)
                 diam = diameter_parent[super_index]
             x = self.feature_fusion(diam, x)
 
         # MLP on input features to change channel size
         if self.in_mlp is not None:
+            # Ensure norm_index is on the same device as x
+            if norm_index is not None and norm_index.device != x.device:
+                norm_index = norm_index.to(x.device)
             x = self.in_mlp(x, batch=norm_index)
 
         # Transformer blocks

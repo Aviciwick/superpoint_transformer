@@ -5,7 +5,10 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from sklearn.linear_model import RANSACRegressor
 from torch_scatter import scatter_min
-from torch_ransac3d.plane import plane_fit
+try:
+    from torch_ransac3d.plane import plane_fit as _plane_fit
+except Exception:
+    _plane_fit = None
 
 from src.utils.partition import xy_partition
 from src.utils.point import is_xyz_tensor
@@ -131,7 +134,25 @@ def single_plane_model(pos, random_state=0, residual_threshold=1e-3):
             return z - torch.from_numpy(ransac.predict(xy.cpu().numpy())).to(device)
 
     else:
-        result = plane_fit(
+        if _plane_fit is None:
+            # CPU fallback using sklearn RANSAC
+            xy = pos[:, :2].cpu().numpy()
+            z = pos[:, 2].cpu().numpy()
+            ransac = RANSACRegressor(
+                random_state=random_state,
+                residual_threshold=residual_threshold).fit(
+                xy, z)
+
+            def predict_elevation(pos_query):
+                assert is_xyz_tensor(pos_query)
+                device = pos_query.device
+                xy_q = pos_query[:, :2]
+                z_q = pos_query[:, 2]
+                return z_q - torch.from_numpy(ransac.predict(xy_q.cpu().numpy())).to(device)
+
+            return predict_elevation
+
+        result = _plane_fit(
             pts=pos,
             thresh=residual_threshold,
             max_iterations=100,

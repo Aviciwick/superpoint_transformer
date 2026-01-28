@@ -7,7 +7,12 @@ from typing import Any, Callable, Dict, List
 import hydra
 from omegaconf import DictConfig
 from pytorch_lightning import Callback
-from pytorch_lightning.loggers import Logger
+try:
+    from pytorch_lightning.loggers import Logger
+except Exception:
+    class Logger:
+        def log_hyperparams(self, *args, **kwargs):
+            pass
 from pytorch_lightning.utilities import rank_zero_only
 
 from src.utils import pylogger, rich_utils
