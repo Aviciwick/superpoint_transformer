@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 
 # Add project root to path
 sys.path.append(os.getcwd())
+os.environ["PROJECT_ROOT"] = os.getcwd()
 
 from src.visualization.visualization import visualize_3d
 from src.utils.hydra import init_config
@@ -17,10 +18,10 @@ def main():
     # 1. Initialize Hydra and load config
     # We assume we are running from project root
     cfg = init_config(config_name="train.yaml", overrides=[
-        "experiment=panoptic/s3dis_with_stuff",
+        "experiment=panoptic/kitti360",
         "datamodule.dataloader.batch_size=1",
         "datamodule.dataloader.num_workers=0",
-        "ckpt_path=/workspace/exos_8t_0/jts/superpoint_transformer/logs/train/runs/2025-12-03_12-51-22/checkpoints/epoch_759.ckpt" 
+        "ckpt_path=/workspace/exos_8t_0/jts/OpenIns3D_new/superpoint_transformer/logs/train/runs/2026-01-29_13-54-08/checkpoints/epoch_199.ckpt" 
     ])
 
     # 2. Instantiate Datamodule
@@ -94,7 +95,16 @@ def main():
     # 9. Save HTML
     output_html = "visualization.html"
     fig = output['figure']
-    fig.write_html(output_html)
+
+    # Update layout to be responsive and full screen
+    fig.update_layout(
+        autosize=True,
+        width=None,
+        height=None,
+        margin=dict(l=0, r=0, b=0, t=0)
+    )
+
+    fig.write_html(output_html, config={'responsive': True})
     print(f"Visualization saved to {output_html}")
 
 if __name__ == "__main__":

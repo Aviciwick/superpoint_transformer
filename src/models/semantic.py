@@ -27,6 +27,13 @@ from src.optim.lr_scheduler import ON_PLATEAU_SCHEDULERS
 from src.data import NAG, Data
 from src.transforms import Transform, NAGSaveNodeIndex, PretrainedCNN
 
+# H-SPT 模块导入
+try:
+    from src.hspt import HSPTModule, build_packed_points, compute_refine_loss
+    HSPT_AVAILABLE = True
+except ImportError:
+    HSPT_AVAILABLE = False
+
 log = logging.getLogger(__name__)
 
 
@@ -146,6 +153,7 @@ class SemanticSegmentationModule(LightningModule):
             track_val_every_n_epoch: int = 1,
             track_val_idx: int = None,
             track_test_idx: int = None,
+            hspt: dict = None,
             **kwargs):
         super().__init__()
 
@@ -252,6 +260,41 @@ class SemanticSegmentationModule(LightningModule):
         # Explicitly call the garbage collector after a certain number
         # of steps
         self.gc_every_n_steps = int(gc_every_n_steps)
+        
+        # ===========================
+        # H-SPT 模块初始化
+        # ===========================
+        self.hspt_enabled = False
+        self.hspt = None
+        self.hspt_config = hspt or {}
+        
+        if self.hspt_config.get('enable', False):
+            if not HSPT_AVAILABLE:
+                log.warning("H-SPT 模块未找到，跳过初始化")
+            elif getattr(self.net, 'nano', False):
+                log.warning("nano 模式不支持 H-SPT（需要原子点数据），跳过初始化")
+            else:
+                self.hspt_enabled = True
+                self.hspt = HSPTModule(
+                    d_model=self.net.out_dim if not self.multi_stage_loss else self.net.out_dim[0],
+                    num_classes=num_classes,
+                    topk_ratio=self.hspt_config.get('topk_ratio', 0.2),
+                    n_sample=self.hspt_config.get('n_sample', 64),
+                    d_raw=self.hspt_config.get('d_raw', 6),
+                    n_heads=self.hspt_config.get('n_heads', 4),
+                    use_residual=self.hspt_config.get('use_residual', True),
+                    dropout=self.hspt_config.get('dropout', 0.1),
+                    alpha=self.hspt_config.get('alpha', 0.7),
+                    beta=self.hspt_config.get('beta', 0.3)
+                )
+                self.hspt_lambda_refine = self.hspt_config.get('lambda_refine', 0.5)
+                self.hspt_raw_keys = self.hspt_config.get('raw_keys', ['pos'])
+                log.info(f"H-SPT 模块已启用: topk_ratio={self.hspt_config.get('topk_ratio', 0.2)}, "
+                         f"n_sample={self.hspt_config.get('n_sample', 64)}, "
+                         f"lambda_refine={self.hspt_lambda_refine}")
+                
+                # 初始化 H-SPT refine loss 指标
+                self.train_refine_loss = MeanMetric()
 
     def cnn_weights_initialization(self) -> None:
         if not getattr(self.net.first_stage, 'cnn_blocks', False):
@@ -290,15 +333,76 @@ class SemanticSegmentationModule(LightningModule):
             log.info("The pretrained CNN will NOT be frozen during training.")
 
     def forward(self, nag: NAG) -> SemanticSegmentationOutput:
+        """
+        前向传播。
+        
+        若启用 H-SPT，会执行以下额外操作：
+        1. 使用 AUS 筛选困难超点
+        2. 使用 CAFM 增强特征
+        3. 使用 RRH 输出点级预测
+        """
         x = self.net(nag)
-        logits = [head(x_) for head, x_ in zip(self.head, x)] \
-            if self.multi_stage_loss else self.head(x)
-
+        
+        # 获取超点特征（用于主分类头和 H-SPT）
+        sp_features = x[0] if self.multi_stage_loss else x
+        
+        # 计算粗分类 logits
+        coarse_logits = self.head[0](sp_features) if self.multi_stage_loss else self.head(sp_features)
+        
+        # ===========================
+        # H-SPT 集成
+        # ===========================
+        hspt_output = None
+        if self.hspt_enabled and self.hspt is not None:
+            try:
+                # 获取超点质心
+                sp_centroids = nag[1].pos if hasattr(nag[1], 'pos') else None
+                
+                if sp_centroids is not None:
+                    # 构建 packed 点张量
+                    packed_raw_points, packed_point_idx, packed_mask = build_packed_points(
+                        nag,
+                        n_sample=self.hspt.n_sample,
+                        raw_keys=self.hspt_raw_keys,
+                        device=sp_features.device
+                    )
+                    
+                    # 运行 H-SPT 流水线
+                    hspt_output = self.hspt(
+                        sp_features=sp_features,
+                        sp_centroids=sp_centroids,
+                        coarse_logits=coarse_logits,
+                        packed_raw_points=packed_raw_points,
+                        packed_mask=packed_mask,
+                        handcrafted_features=None  # 可选：从 nag[1] 获取几何特征
+                    )
+                    
+                    # 使用融合后的特征重新计算 logits
+                    if hspt_output.fused_features is not None:
+                        sp_features = hspt_output.fused_features
+                        coarse_logits = self.head[0](sp_features) if self.multi_stage_loss else self.head(sp_features)
+                    
+                    # 保存 packed_point_idx 供 loss 计算使用
+                    hspt_output.packed_point_idx = packed_point_idx
+            except Exception as e:
+                log.warning(f"H-SPT 前向传播失败: {e}，回退到基线模式")
+                hspt_output = None
+        
+        # 构建最终 logits
+        if self.multi_stage_loss:
+            logits = [coarse_logits] + [head(x_) for head, x_ in zip(self.head[1:], x[1:])]
+        else:
+            logits = coarse_logits
+        
         output = SemanticSegmentationOutput(logits)
-
+        
         if self.net.store_features:
             output.x = x
-
+        
+        # 附加 H-SPT 输出（供 model_step 计算 refine loss）
+        if hspt_output is not None:
+            output.hspt_output = hspt_output
+        
         return output
 
     @property
@@ -473,6 +577,36 @@ class SemanticSegmentationModule(LightningModule):
             else:
                 raise ValueError(
                     f"Unknown single-stage loss '{self.hparams.loss_type}'")
+
+        # ===========================
+        # H-SPT Refine Loss （点级细化损失）
+        # ===========================
+        if self.hspt_enabled and hasattr(output, 'hspt_output') and output.hspt_output is not None:
+            hspt_out = output.hspt_output
+            if hspt_out.point_logits is not None and hspt_out.point_logits.numel() > 0:
+                try:
+                    # 获取原子点 GT 标签
+                    if hasattr(nag[0], 'y') and nag[0].y is not None:
+                        gt_labels = nag[0].y
+                        
+                        # 计算 refine loss
+                        refine_loss = compute_refine_loss(
+                            point_logits=hspt_out.point_logits,
+                            packed_point_idx=hspt_out.packed_point_idx,
+                            hard_sp_indices=hspt_out.hard_sp_indices,
+                            gt_labels=gt_labels,
+                            packed_mask=hspt_out.packed_mask,
+                            num_classes=self.num_classes,
+                            ignore_index=self.num_classes
+                        )
+                        
+                        # 加权求和
+                        loss = loss + self.hspt_lambda_refine * refine_loss
+                        
+                        # 保存 refine loss 用于日志
+                        output.refine_loss = refine_loss
+                except Exception as e:
+                    log.warning(f"H-SPT refine loss 计算失败: {e}")
 
         return loss, output
 

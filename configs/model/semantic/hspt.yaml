@@ -1,0 +1,29 @@
+# @package model
+# H-SPT (Hybrid SuperPoint Transformer) 模块配置
+# 在 spt.yaml 的 defaults 中引入: - /model/semantic/hspt
+
+hspt:
+  # 是否启用 H-SPT 模块
+  enable: false  # 默认关闭，需显式开启
+  
+  # AUS (Adaptive Uncertainty Sampler) 参数
+  topk_ratio: 0.2    # 采样比例，选取前 20% 困难超点
+  alpha: 0.7         # 语义熵权重
+  beta: 0.3          # 几何特征权重
+  
+  # CAFM (Cross-Attention Fusion Module) 参数
+  n_sample: 64       # 每个超点采样的点数
+  d_raw: 3           # 原始点特征维度 (仅 XYZ)
+  n_heads: 4         # 注意力头数
+  dropout: 0.1       # Dropout 比率
+  
+  # RRH (Residual Refinement Head) 参数
+  use_residual: true # 是否使用残差模式 (Final = Base + Delta)
+  
+  # Loss 参数
+  lambda_refine: 0.5 # refine loss 权重
+  
+  # 高级选项
+  use_padding_mask: true  # 是否使用 padding mask
+  raw_keys:               # 用于构建 packed_raw_points 的属性键
+    - pos

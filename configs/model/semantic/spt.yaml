@@ -5,6 +5,7 @@ defaults:
   - /model/semantic/_down.yaml
   - /model/semantic/_up.yaml
   - /model/semantic/_attention.yaml
+  - /model/semantic/hspt.yaml
 
 net:
   _target_: src.models.components.spt.SPT

@@ -213,6 +213,30 @@ class PanopticQuality3D(Metric):
         data points. Said otherwise, all points belong to one and only
         one prediction and one and only one target.
         """
+        if len(self.prediction_semantic) == 0:
+            log.warning("PanopticQuality3D: No predictions available to compute. Returning NaN/Zero metrics.")
+            metrics = PanopticMetricResults()
+            device = self.device
+            nan_scalar = torch.tensor(float('nan'), device=device)
+            nan_vector = torch.full((self.num_classes,), float('nan'), device=device)
+            
+            # Scalar metrics
+            for k in ['pq', 'sq', 'rq', 'pq_modified', 'pq_thing', 'sq_thing', 'rq_thing', 
+                      'pq_stuff', 'sq_stuff', 'rq_stuff', 'mean_precision', 'mean_recall']:
+                setattr(metrics, k, nan_scalar)
+                
+            # Class-wise metrics
+            for k in ['pq_per_class', 'sq_per_class', 'rq_per_class', 'precision_per_class', 
+                      'recall_per_class', 'pq_modified_per_class']:
+                setattr(metrics, k, nan_vector)
+            
+            # Counts (TP/FP/FN) - set to 0
+            zero_vector = torch.zeros(self.num_classes, device=device)
+            for k in ['tp_per_class', 'fp_per_class', 'fn_per_class']:
+                setattr(metrics, k, zero_vector)
+
+            return metrics
+
         # Batch together the values stored in the internal states.
         # Importantly, the InstanceBatch mechanism ensures there is no
         # collision between object labels of the stored scenes
