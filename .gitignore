@@ -173,3 +173,5 @@ local
 ckpt
 outputs
 wandb
+
+*.html
