@@ -1,0 +1,2 @@
+- experiment=panoptic/kitti360
+- ckpt_path=/workspace/exos_8t_0/jts/OpenIns3D_new/superpoint_transformer/logs/train/runs/2026-01-28_10-37-30/checkpoints/last.ckpt
