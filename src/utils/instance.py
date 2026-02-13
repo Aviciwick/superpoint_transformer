@@ -10,6 +10,7 @@ import matplotlib.patches as patches
 import matplotlib.cm as cm
 from torch.nn.functional import one_hot
 from torch_geometric.nn.pool.consecutive import consecutive_cluster
+<<<<<<< HEAD
 try:
     from pycut_pursuit.cp_d0_dist import cp_d0_dist as _cp_d0_dist
 except Exception:
@@ -18,6 +19,10 @@ try:
     from grid_graph import edge_list_to_forward_star as _edge_list_to_forward_star
 except Exception:
     _edge_list_to_forward_star = None
+=======
+from pycut_pursuit.cp_d0_dist import cp_d0_dist
+from grid_graph import edge_list_to_forward_star
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
 
 from src.utils.hydra import init_config
 from src.utils.neighbors import knn_2
@@ -473,6 +478,7 @@ def _instance_cut_pursuit(
     edge_discrepancy = edge_affinity / (1 - edge_affinity + discrepancy_epsilon)
 
     # Convert edges to forward-star (or CSR) representation
+<<<<<<< HEAD
     if _edge_list_to_forward_star is None:
         # Fallback: build simple CSR from edge_index
         ei = edge_index.T.contiguous().cpu().numpy()
@@ -487,6 +493,10 @@ def _instance_cut_pursuit(
     else:
         source_csr, target, reindex = _edge_list_to_forward_star(
             num_nodes, edge_index.T.contiguous().cpu().numpy())
+=======
+    source_csr, target, reindex = edge_list_to_forward_star(
+        num_nodes, edge_index.T.contiguous().cpu().numpy())
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
     source_csr = source_csr.astype('uint32')
     target = target.astype('uint32')
     edge_weights = edge_discrepancy.cpu().numpy()[reindex] * regularization \
@@ -525,6 +535,7 @@ def _instance_cut_pursuit(
     coor_weights[x_dim:] *= p_weight
 
     # Partition computation
+<<<<<<< HEAD
     if _cp_d0_dist is None:
         # Fallback: simple connected components on edge_index by thresholding discrepancies
         # Build graph and assign each node to its own component, then merge along edges with high affinity
@@ -544,6 +555,9 @@ def _instance_cut_pursuit(
         obj_index = comp
         return obj_index
     obj_index, x_c, cluster, edges, times = _cp_d0_dist(
+=======
+    obj_index, x_c, cluster, edges, times = cp_d0_dist(
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
         l2_dim,
         x,
         source_csr,

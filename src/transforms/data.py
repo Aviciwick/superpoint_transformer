@@ -86,10 +86,16 @@ class Cast(Transform):
         # holding Tensors
         cast = lambda x: cast_tensor(
             x, fp_dtype=self.fp_dtype, int_dtype=self.int_dtype, optimal_int_dtype=self.optimal_int_dtype)
+<<<<<<< HEAD
 
         keys = data.keys() if callable(data.keys) else data.keys
         for k in keys:
 
+=======
+
+        for k in data.keys:
+
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
             # Specific behavior for casting 'rgb' and 'mean_rgb'
             # attributes
             if k in ['rgb', 'mean_rgb']:

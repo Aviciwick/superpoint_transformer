@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch import Tensor, LongTensor
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+<<<<<<< HEAD
 try:
     from torchmetrics.detection.mean_ap import MeanAveragePrecision
 except Exception:
@@ -24,6 +25,9 @@ except Exception:
             return R()
         def to(self, *args, **kwargs):
             return self
+=======
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
 from torchmetrics.utilities.imports import _TORCHVISION_GREATER_EQUAL_0_8
 from torch_geometric.nn.pool.consecutive import consecutive_cluster
 from src.data import InstanceData, InstanceBatch

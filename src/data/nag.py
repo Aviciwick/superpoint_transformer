@@ -56,6 +56,7 @@ class NAG(TensorHolderMixIn):
         for i in self.level_range:
             yield self[i]
 
+<<<<<<< HEAD
     def to(self, device, *args, **kwargs):
         """Moves all tensors to the specified device."""
         for i in range(len(self._list)):
@@ -79,6 +80,16 @@ class NAG(TensorHolderMixIn):
         """Compute the number of `low`-level elements contained in each
         `high`-level superpoint.
 
+=======
+    def get_sub_size(
+            self,
+            high: int,
+            low: int = 0
+    ) -> List[torch.Tensor]:
+        """Compute the number of `low`-level elements contained in each
+        `high`-level superpoint.
+
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
         The sizes are computed in a bottom-up approach using the
         `super_index` at each level, starting from the `low`-level
         sizes. The `low` sizes are initialized using the following
@@ -120,6 +131,7 @@ class NAG(TensorHolderMixIn):
                 f"Cannot infer the size of level {low=} element sizes")
 
         for i in range(low + 1, high):
+<<<<<<< HEAD
             # Fallback for inconsistent hierarchy
             # Check if self[i].super_index is valid for scatter_sum
             # super_index is used as index. src is sub_sizes.
@@ -152,6 +164,8 @@ class NAG(TensorHolderMixIn):
                 # But here we check against sub_sizes length? No.
                 pass
                 
+=======
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
             sub_sizes = scatter_sum(sub_sizes, self[i].super_index, dim=0)
 
         return sub_sizes

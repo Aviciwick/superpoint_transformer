@@ -773,8 +773,13 @@ class SPT(nn.Module):
                             keys=self.point_hf, 
                             to='x', 
                             delete_after=False)
+<<<<<<< HEAD
         
         nag.add_keys_to(level='1+', 
+=======
+            
+            nag.add_keys_to(level=0, 
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
                             keys=self.post_cnn_point_hf, 
                             to='x_mlp', 
                             delete_after=not self.store_features)
@@ -819,6 +824,7 @@ class SPT(nn.Module):
                 # Forward on the down stage and the corresponding NAG
                 # level
                 i_level = i_stage + 1 + self.nano
+<<<<<<< HEAD
 
                 # Ensure all tensors are on the correct device
                 # This handles the case where DataModule/Batch creation leaves tensors on CPU
@@ -837,6 +843,8 @@ class SPT(nn.Module):
                     nag[i_level].edge_attr = nag[i_level].edge_attr.to(target_device)
                 if hasattr(nag[i_level], 'v_edge_attr') and nag[i_level].v_edge_attr is not None and nag[i_level].v_edge_attr.device != target_device:
                     nag[i_level].v_edge_attr = nag[i_level].v_edge_attr.to(target_device)
+=======
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
 
                 # Process handcrafted node and edge features. We need to
                 # do this here before those can be passed to the

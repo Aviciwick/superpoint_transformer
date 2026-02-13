@@ -846,6 +846,7 @@ class RadiusHorizontalGraph(Transform):
         # to alleviate memory and compute. Features for all undirected
         # edges can be computed later using
         # `_on_the_fly_horizontal_edge_features()`
+<<<<<<< HEAD
         
         # Check if edge_index has valid indices
         # nag[i_level].num_nodes is the number of nodes at this level
@@ -878,6 +879,15 @@ class RadiusHorizontalGraph(Transform):
                 # If we are here, it means some indices in se_point_index or se_id are wrong.
                 pass
             raise e
+=======
+        data = _minimalistic_horizontal_edge_features(
+            data,
+            nag[0].pos,
+            se_point_index,
+            se_id,
+            keys=self.keys,
+            verbose=verbose)
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
 
         # Restore the i_level Data object
         # NB : As the NAG necessarily has atoms at this stage, the indexing

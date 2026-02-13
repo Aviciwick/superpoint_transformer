@@ -47,6 +47,7 @@ def _frnn_grid_points(xyz_query, xyz_search, K=1, r=1):
     else:
         K = torch.tensor([K], device=device)
 
+<<<<<<< HEAD
     # Run the actual FRNN search if available; otherwise fallback to brute force
     if _frnn is not None:
         return _frnn.frnn_grid_points(xyz_query, xyz_search, K=K, r=r)
@@ -142,6 +143,10 @@ def _frnn_grid_points(xyz_query, xyz_search, K=1, r=1):
         idx_top = idx_sorted[:, :Kval].unsqueeze(0)
         # Placeholders to mimic FRNN API
         return d_top, idx_top, None, None
+=======
+    # Run the actual FRNN search
+    return frnn.frnn_grid_points(xyz_query, xyz_search, K=K, r=r)
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
 
 
 def knn_1(

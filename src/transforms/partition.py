@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from torch_scatter import scatter_sum, scatter_mean
 from omegaconf import OmegaConf
+<<<<<<< HEAD
 try:
     from pycut_pursuit.cp_d0_dist import cp_d0_dist as _cp_d0_dist
 except Exception:
@@ -10,6 +11,10 @@ try:
     from grid_graph import edge_list_to_forward_star as _edge_list_to_forward_star
 except Exception:
     _edge_list_to_forward_star = None
+=======
+from pycut_pursuit.cp_d0_dist import cp_d0_dist
+from grid_graph import edge_list_to_forward_star
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
 
 from src.transforms import Transform
 from src.data import Data, NAG, Cluster, InstanceData
@@ -18,11 +23,19 @@ from src.utils import (
     xyz_partition, 
     compute_edge_distances_batch,
     available_cpu_count)
+<<<<<<< HEAD
 
 from src.utils.components import merge_components_by_contour_prior_on_data
 from src.nn import CatFusion
 
 
+=======
+
+from src.utils.components import merge_components_by_contour_prior_on_data
+from src.nn import CatFusion
+
+
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
 __all__ = ['CutPursuitPartition', 'GridPartition', 'GreedyContourPriorPartition']
 
 class CutPursuitPartition(Transform):
@@ -193,6 +206,7 @@ class CutPursuitPartition(Transform):
                     f"data type for `index_t`.")
 
             # Convert edges to forward-star (or CSR) representation
+<<<<<<< HEAD
             if _edge_list_to_forward_star is not None:
                 source_csr, target, reindex = _edge_list_to_forward_star(
                     d1.num_nodes,
@@ -235,6 +249,11 @@ class CutPursuitPartition(Transform):
                 # np.cumsum(counts, out=source_csr[1:]) # This might fail if shapes mismatch
                 source_csr[1:] = np.cumsum(counts)
             
+=======
+            source_csr, target, reindex = edge_list_to_forward_star(
+                d1.num_nodes,
+                d1.edge_index.T.contiguous().cpu().numpy())
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
             source_csr = source_csr.astype('uint32')
             target = target.astype('uint32')
             edge_weights = d1.edge_attr.cpu().numpy()[reindex] * reg \
@@ -252,6 +271,7 @@ class CutPursuitPartition(Transform):
             coor_weights[:n_dim] *= sw
 
             # Partition computation
+<<<<<<< HEAD
             if _cp_d0_dist is not None:
                 super_index, x_c, cluster, edges, times = _cp_d0_dist(
                     n_dim + n_feat,
@@ -344,6 +364,26 @@ class CutPursuitPartition(Transform):
                 ]
                 
                 times = np.zeros(10) # Dummy times
+=======
+            super_index, x_c, cluster, edges, times = cp_d0_dist(
+                n_dim + n_feat,
+                x,
+                source_csr,
+                target,
+                edge_weights=edge_weights,
+                vert_weights=node_size,
+                coor_weights=coor_weights,
+                min_comp_weight=cut,
+                cp_dif_tol=1e-2,
+                cp_it_max=self.iterations,
+                split_damp_ratio=0.7,
+                verbose=self.verbose,
+                max_num_threads=num_threads,
+                balance_parallel_split=True,
+                compute_Time=True,
+                compute_List=True,
+                compute_Graph=True)
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
 
             if self.verbose:
                 if _cp_d0_dist is not None:
@@ -454,8 +494,13 @@ class CutPursuitPartition(Transform):
                      super_index = torch.arange(node_size.shape[0], dtype=torch.int64)
 
             node_size_new = scatter_sum(
+<<<<<<< HEAD
                 node_size.to(device),
                 super_index.to(device), dim=0).cpu().long()
+=======
+                node_size.cuda(),
+                super_index.cuda(), dim=0).cpu().long()
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
             d2 = Data(
                 pos=pos,
                 x=x,
@@ -469,10 +514,14 @@ class CutPursuitPartition(Transform):
                 d2.obj = d1.obj.merge(d1.super_index.to(d1.obj.device))
 
             # Trim the graph
+<<<<<<< HEAD
             # Note: With identity fallback, the graph is already "trimmed" (same as input)
             # But we must call to_trimmed to ensure consistency if edge_reduce is needed
             # or if we want to remove self-loops etc.
             # d2 = d2.to_trimmed(reduce=self.edge_reduce) # Already done in fallback setup basically
+=======
+            d2 = d2.to_trimmed(reduce=self.edge_reduce)
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
 
             # If some nodes are isolated in the graph, connect them to
             # their nearest neighbors, so their absence of connectivity
@@ -501,7 +550,11 @@ class CutPursuitPartition(Transform):
                     d1.y.cuda(), d1.super_index.cuda(), dim=0).cpu()
                 torch.cuda.empty_cache()
 
+<<<<<<< HEAD
             if 'semantic_pred' in keys_list:
+=======
+            if 'semantic_pred' in d1.keys:
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
                 assert d1.semantic_pred.dim() == 2, \
                     "Expected Data.semantic_pred to hold `(num_nodes, num_classes)` " \
                     "histograms, not single labels"
