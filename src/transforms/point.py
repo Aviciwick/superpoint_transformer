@@ -302,6 +302,7 @@ class GroundElevation(Transform):
         # 100% sure
         pos_trimmed = pos[mask]
 
+<<<<<<< HEAD
         if pos_trimmed.shape[0] < 3:
             log.warning(
                 f"GroundElevation: Too few points ({pos_trimmed.shape[0]}) to fit "
@@ -310,6 +311,8 @@ class GroundElevation(Transform):
                 (pos.shape[0], 1), device=pos.device, dtype=pos.dtype)
             return data
 
+=======
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
         # Fit a model to the trimmed points
         if self.model == 'ransac':
             model = single_plane_model(

@@ -122,8 +122,12 @@ class PanopticQuality3D(Metric):
             compute_on_cpu: bool = False,
             **kwargs: Any
     ) -> None:
+<<<<<<< HEAD
         self._compute_on_cpu = compute_on_cpu
         super().__init__(**kwargs)
+=======
+        super().__init__(compute_on_cpu=compute_on_cpu, **kwargs)
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
 
         # Store the number of valid classes in the dataset
         self.num_classes = num_classes
@@ -213,6 +217,7 @@ class PanopticQuality3D(Metric):
         data points. Said otherwise, all points belong to one and only
         one prediction and one and only one target.
         """
+<<<<<<< HEAD
         if len(self.prediction_semantic) == 0:
             log.warning("PanopticQuality3D: No predictions available to compute. Returning NaN/Zero metrics.")
             metrics = PanopticMetricResults()
@@ -237,6 +242,8 @@ class PanopticQuality3D(Metric):
 
             return metrics
 
+=======
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
         # Batch together the values stored in the internal states.
         # Importantly, the InstanceBatch mechanism ensures there is no
         # collision between object labels of the stored scenes

@@ -1,9 +1,13 @@
 import torch
 import numpy as np
+<<<<<<< HEAD
 try:
     import pgeof
 except Exception:
     pgeof = None
+=======
+import pgeof
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
 import math
 from tqdm import tqdm
 
@@ -102,7 +106,11 @@ def geometric_features(
     # approaches for computing the geometric features. If on CPU, we
     # will rely on the pgeof library. If on GPU, we will use a
     # torch-cuda implementation
+<<<<<<< HEAD
     if xyz.is_cpu and pgeof is not None:
+=======
+    if xyz.is_cpu:
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
         features = geometric_features_pgeof(
             xyz,
             nn,

@@ -1208,7 +1208,11 @@ class SampleRadiusSubgraphs(BaseSampleSubgraphs):
         batch_query = batch[idx_seed] if batch is not None else None
 
         # Prepare the inputs for the neighborhood search
+<<<<<<< HEAD
         mask = torch.tensor([[1, 1, not self.cylindrical]], device=nag[i_level].pos.device)
+=======
+        mask = torch.tensor([[1, 1, not self.cylindrical]], device=nag.device)
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
         pos_search = nag[i_level].pos * mask
         pos_query = nag[i_level].pos[idx_seed] * mask
 

@@ -226,11 +226,14 @@ class OnTheFlyInstanceGraph(Transform):
         joint_obj_idx = torch.cat((sp_obj_idx, obj_idx))
         joint_obj_idx_consec = consecutive_cluster(joint_obj_idx)[0]
         sp_obj_idx_consec = joint_obj_idx_consec[:sp_obj_idx.numel()]
+<<<<<<< HEAD
         
         # Ensure sp_obj_idx_consec is on the same device as obj_pos
         if sp_obj_idx_consec.device != obj_pos.device:
             sp_obj_idx_consec = sp_obj_idx_consec.to(obj_pos.device)
             
+=======
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
         data.obj_pos = obj_pos[sp_obj_idx_consec]
 
         # Save in the data in the NAG structure

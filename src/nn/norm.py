@@ -113,10 +113,13 @@ class UnitSphereNorm(nn.Module):
         """Forward with scatter operations, in case `idx` is provided.
         Applies the sphere normalization for each segment separately.
         """
+<<<<<<< HEAD
         # Ensure idx is on the same device as pos
         if idx.device != pos.device:
             idx = idx.to(pos.device)
 
+=======
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
         # Compute the diameter (i.e. the maximum span along the main axes
         # here)
         min_segment = scatter(pos, idx, dim=0, dim_size=num_super, reduce='min')

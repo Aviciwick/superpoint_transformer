@@ -178,8 +178,12 @@ class Data(PyGData):
     @property
     def v_edge_keys(self) -> List[str]:
         """All keys starting with `v_edge_`."""
+<<<<<<< HEAD
         keys = self.keys() if callable(self.keys) else self.keys
         return [k for k in keys if isinstance(k, str) and k.startswith('v_edge_')]
+=======
+        return [k for k in self.keys if k.startswith('v_edge_')]
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
 
     @property
     def num_points(self):
@@ -1143,7 +1147,7 @@ class Data(PyGData):
         setattr(self, to, torch.cat(feat_list, dim=1))
 
 
-class Batch(PyGBatch):
+class Batch(PyGBatch, Data):
     """Inherit from torch_geometric.Batch with extensions tailored to
     our specific needs.
 

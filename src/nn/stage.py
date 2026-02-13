@@ -247,9 +247,12 @@ class Stage(nn.Module):
 
         # Append normalized coordinates to the node features
         if pos is not None:
+<<<<<<< HEAD
             # Ensure pos is on the same device as x
             if pos.device != x.device:
                 pos = pos.to(x.device)
+=======
+>>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
             normalized_pos, diameter_parent = self.pos_norm(pos, super_index, w=node_size)
             if self.use_pos:
                 x = self.feature_fusion(normalized_pos, x)
