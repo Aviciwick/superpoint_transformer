@@ -1,3 +1,0 @@
-- experiment=panoptic/s3dis_with_stuff
-- datamodule.fold=5
-- ckpt_path=/workspace/exos_8t_0/jts/OpenIns3D_new/superpoint_transformer/logs/train/runs/2025-12-03_12-51-22/checkpoints/last.ckpt
