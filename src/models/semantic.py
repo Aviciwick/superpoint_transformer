@@ -279,7 +279,7 @@ class SemanticSegmentationModule(LightningModule):
                     num_classes=num_classes,
                     topk_ratio=self.hspt_config.get('topk_ratio', 0.2),
                     n_sample=self.hspt_config.get('n_sample', 64),
-                    d_raw=self.hspt_config.get('d_raw', 6),
+                    d_raw=self.hspt_config.get('d_raw', 3),
                     n_heads=self.hspt_config.get('n_heads', 4),
                     use_residual=self.hspt_config.get('use_residual', True),
                     dropout=self.hspt_config.get('dropout', 0.1),
@@ -845,6 +845,9 @@ class SemanticSegmentationModule(LightningModule):
         self.train_cm(
             output.semantic_pred().detach(),
             output.semantic_target.detach())
+        # H-SPT refine loss 指标更新
+        if self.hspt_enabled and hasattr(output, 'refine_loss'):
+            self.train_refine_loss(output.refine_loss.detach())
 
     def train_step_log_metrics(self) -> None:
         """Log train metrics after a single step with the content of the
@@ -856,6 +859,14 @@ class SemanticSegmentationModule(LightningModule):
             on_step=False,
             on_epoch=True,
             prog_bar=True)
+        # H-SPT refine loss 日志
+        if self.hspt_enabled:
+            self.log(
+                "train/refine_loss",
+                self.train_refine_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False)
 
     def on_train_epoch_end(self) -> None:
         self._on_train_epoch_end(

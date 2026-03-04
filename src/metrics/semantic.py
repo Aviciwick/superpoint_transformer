@@ -2,7 +2,6 @@ import os
 import torch
 import logging
 import numpy as np
-<<<<<<< HEAD
 try:
     from torchmetrics.classification import MulticlassConfusionMatrix
 except Exception:
@@ -22,9 +21,6 @@ except Exception:
                     self.confmat[p, t] += 1
         def compute(self):
             return self.confmat
-=======
-from torchmetrics.classification import MulticlassConfusionMatrix
->>>>>>> 69e401d1fc5419e6e6be24615925892a2f7a53ca
 from torch_scatter import scatter_sum
 from src.metrics.mean_average_precision import BaseMetricResults
 
