@@ -22,29 +22,10 @@ sys.path.insert(0, os.path.join(project_root, 'src'))
 import pytest
 import torch
 
-# 使用 importlib 加载模块
-import importlib.util
-
-# 加载 AUS
-aus_path = os.path.join(project_root, 'src', 'Hybrid-SPT', 'AdaptiveUncertaintySampler', 'sampler.py')
-spec = importlib.util.spec_from_file_location('sampler', aus_path)
-sampler_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(sampler_module)
-AdaptiveUncertaintySampler = sampler_module.AdaptiveUncertaintySampler
-
-# 加载 CAFM
-cafm_path = os.path.join(project_root, 'src', 'Hybrid-SPT', 'CrossAttentionFusion', 'fusion.py')
-spec = importlib.util.spec_from_file_location('fusion', cafm_path)
-fusion_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(fusion_module)
-CrossAttentionFusionModule = fusion_module.CrossAttentionFusionModule
-
-# 加载 RRH
-rrh_path = os.path.join(project_root, 'src', 'Hybrid-SPT', 'ResidualRefinementHead', 'refinement.py')
-spec = importlib.util.spec_from_file_location('refinement', rrh_path)
-refinement_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(refinement_module)
-ResidualRefinementHead = refinement_module.ResidualRefinementHead
+# 直接从生产路径导入
+from src.hspt.aus import AdaptiveUncertaintySampler
+from src.hspt.cafm import CrossAttentionFusionModule
+from src.hspt.rrh import ResidualRefinementHead
 
 
 def run_hspt_pipeline(

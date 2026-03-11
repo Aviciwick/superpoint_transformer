@@ -87,15 +87,16 @@ class CrossAttentionFusionModule(nn.Module):
             f"d_model ({d_model}) 必须能被 n_heads ({n_heads}) 整除"
         
         self.d_model = d_model
-        self.d_raw = d_raw
         self.n_heads = n_heads
+        self._materialized_d_raw = None  # 材化后记录的实际 d_raw
         
         # ===========================
         # 1. 点云编码器 (Mini-PointNet)
         # ===========================
-        # 将 (Local_XYZ + RGB) 映射到 d_model 维度
+        # 使用 LazyLinear 自动适配输入维度（首次 forward 时材化）
+        # 支持不同数据集的不同属性维度（ScanNet d_raw=6, KITTI-360 d_raw=3）
         self.point_encoder = nn.Sequential(
-            nn.Linear(d_raw, d_model),
+            nn.LazyLinear(d_model),
             nn.LayerNorm(d_model),
             nn.ReLU(inplace=True),
             nn.Linear(d_model, d_model)
@@ -189,11 +190,17 @@ class CrossAttentionFusionModule(nn.Module):
                 f"packed_raw_points 最后维度必须 >= 3（至少包含 XYZ），"
                 f"实际: {packed_raw_points.shape[-1]}"
             )
-        # d_raw 不匹配时直接报错（Linear 层会崩溃，提前检测）
-        if packed_raw_points.shape[-1] != self.d_raw:
-            raise ValueError(
-                f"packed_raw_points 维度 ({packed_raw_points.shape[-1]}) "
-                f"与 d_raw ({self.d_raw}) 不匹配，请检查 Dataloader 或模块初始化参数"
+        # d_raw 材化后一致性断言
+        actual_d_raw = packed_raw_points.shape[-1]
+        if self._materialized_d_raw is None:
+            # 首次 forward：记录材化维度
+            self._materialized_d_raw = actual_d_raw
+        elif actual_d_raw != self._materialized_d_raw:
+            # 材化后维度变化：直接报错（不允许同一训练中维度跳变）
+            raise RuntimeError(
+                f"CAFM point_encoder 已按 d_raw={self._materialized_d_raw} 材化，"
+                f"但当前输入 d_raw={actual_d_raw}。"
+                f"同一训练中不支持输入维度变化，请检查数据集配置。"
             )
         
         # ===========================
@@ -309,8 +316,9 @@ class CrossAttentionFusionModule(nn.Module):
     
     def extra_repr(self) -> str:
         """返回模块的额外表示信息。"""
+        d_raw_str = self._materialized_d_raw if self._materialized_d_raw is not None else "dynamic"
         return (
-            f"d_model={self.d_model}, d_raw={self.d_raw}, "
+            f"d_model={self.d_model}, d_raw={d_raw_str}, "
             f"n_heads={self.n_heads}, use_ffn={self.use_ffn}"
         )
 

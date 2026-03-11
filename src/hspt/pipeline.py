@@ -97,58 +97,31 @@ def build_packed_points(
         packed_mask = torch.ones(M, n_sample, dtype=torch.bool, device=device)
     else:
         # ===========================
-        # 向量化实现（避免 Python for 循环）
+        # 完全向量化实现（无 Python for 循环）
         # ===========================
         super_index = super_index.to(device)
         
-        # 统计每个超点的点数
+        # 统计每个超点的点数，按 super_index 排序
         counts = torch.bincount(super_index, minlength=M).to(device)
-        
-        # 对每个点分配一个随机排名（用于采样）
-        rand_perm = torch.rand(N_atoms, device=device)
-        
-        # 按超点分组排序，获取每个超点内的局部排名
-        sorted_rand, sorted_indices = rand_perm.sort()
-        sorted_super = super_index[sorted_indices]
-        
-        # 重新按 super_index 排序
         order = super_index.argsort(stable=True)
-        
-        # 计算每个点在其超点内的局部索引
         ptr = torch.cat([torch.zeros(1, dtype=torch.long, device=device), counts.cumsum(0)])
         
-        # 使用 scatter 计算每个点的局部排名
-        local_rank = torch.zeros(N_atoms, dtype=torch.long, device=device)
-        for i in range(N_atoms):
-            sp = super_index[order[i]].item()
-            local_rank[order[i]] = i - ptr[sp]
+        # 批量随机采样：对每个超点生成 n_sample 个 [0, count) 内的随机索引
+        # 使用 modulo 实现重复填充效果
+        counts_clamped = counts.clamp(min=1)  # 避免除以 0
+        random_offsets = torch.randint(
+            0, 2**31 - 1, (M, n_sample), device=device, dtype=torch.long
+        ) % counts_clamped.unsqueeze(1)  # [M, n_sample]，每个值在 [0, count_i)
         
-        # 初始化输出
-        packed_point_idx = torch.full((M, n_sample), -1, dtype=torch.long, device=device)
-        packed_mask = torch.zeros(M, n_sample, dtype=torch.bool, device=device)
+        # 转为全局点索引：ptr[sp] + random_offset
+        global_idx = ptr[:M].unsqueeze(1) + random_offsets  # [M, n_sample]
+        packed_point_idx = order[global_idx]  # [M, n_sample]
         
-        # 对于有点的超点，填充采样索引
-        for sp_idx in range(M):
-            n_pts = counts[sp_idx].item()
-            if n_pts == 0:
-                continue
-            
-            # 获取该超点的点
-            start = ptr[sp_idx].item()
-            end = ptr[sp_idx + 1].item()
-            sp_points = order[start:end]
-            
-            # 随机选择（用 randperm 替代排序）
-            if n_pts >= n_sample:
-                perm = torch.randperm(n_pts, device=device)[:n_sample]
-                sampled = sp_points[perm]
-            else:
-                # 重复填充
-                repeat_times = (n_sample + n_pts - 1) // n_pts
-                sampled = sp_points.repeat(repeat_times)[:n_sample]
-            
-            packed_point_idx[sp_idx] = sampled
-            packed_mask[sp_idx] = True
+        # mask：有效超点（至少 1 个点）
+        packed_mask = (counts > 0).unsqueeze(1).expand(-1, n_sample)  # [M, n_sample]
+        
+        # 对空超点的索引设为 -1
+        packed_point_idx[~packed_mask] = -1
     
     # 构建 packed_raw_points
     raw_tensors = []
@@ -165,6 +138,7 @@ def build_packed_points(
     
     # 拼接所有属性
     raw_data = torch.cat(raw_tensors, dim=-1) if len(raw_tensors) > 1 else raw_tensors[0]
+    raw_data = raw_data.to(device, non_blocking=True)
     d_raw = raw_data.shape[-1]
     
     # Gather 构建 packed_raw_points
@@ -367,9 +341,9 @@ def compute_refine_loss(
     
     参数:
         point_logits: [K, N, C] 点级预测 logits
-        packed_point_idx: [M, N] 或 [K, N] 采样点索引
+        packed_point_idx: [M, N] 所有超点的采样点索引
         hard_sp_indices: [K] 困难超点索引
-        gt_labels: [N_total] 原始点云 GT 标签
+        gt_labels: [N_total] 整数标签 或 [N_total, C] 直方图标签
         packed_mask: [K, N] 有效点掩码
         num_classes: 类别数
         ignore_index: 忽略索引
@@ -383,9 +357,12 @@ def compute_refine_loss(
     if K == 0:
         return torch.tensor(0.0, device=device, requires_grad=True)
     
-    # 获取对应的采样点索引
+    # 如果 gt_labels 是 2D 直方图 [N_total, C]，先转为 1D 整数标签
+    if gt_labels.dim() == 2:
+        gt_labels = gt_labels.argmax(dim=1)
+    
+    # 获取对应的采样点索引（只选困难超点）
     if packed_point_idx.shape[0] != K:
-        # 需要用 hard_sp_indices 索引
         packed_idx_k = packed_point_idx[hard_sp_indices]
     else:
         packed_idx_k = packed_point_idx

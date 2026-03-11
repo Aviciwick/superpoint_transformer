@@ -21,13 +21,8 @@ sys.path.insert(0, os.path.join(project_root, 'src'))
 import pytest
 import torch
 
-# 使用 importlib 加载模块
-import importlib.util
-fusion_path = os.path.join(project_root, 'src', 'Hybrid-SPT', 'CrossAttentionFusion', 'fusion.py')
-spec = importlib.util.spec_from_file_location('fusion', fusion_path)
-fusion_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(fusion_module)
-CrossAttentionFusionModule = fusion_module.CrossAttentionFusionModule
+# 直接从生产路径导入
+from src.hspt.cafm import CrossAttentionFusionModule
 
 
 class TestCrossAttentionFusionModule:

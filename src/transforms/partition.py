@@ -19,7 +19,13 @@ from src.utils import (
     compute_edge_distances_batch,
     available_cpu_count)
 
-from src.utils.components import merge_components_by_contour_prior_on_data
+# 延迟导入：torch_graph_components 可能未安装
+# merge_components_by_contour_prior_on_data 仅在 GreedyContourPriorPartition 中使用
+try:
+    from src.utils.components import merge_components_by_contour_prior_on_data
+    _COMPONENTS_AVAILABLE = True
+except ImportError:
+    _COMPONENTS_AVAILABLE = False
 from src.nn import CatFusion
 
 
@@ -729,6 +735,12 @@ class GreedyContourPriorPartition(Transform):
             "Expected the same number of `reg` and `min_size` parameters"
 
     def _process(self, data):
+        if not _COMPONENTS_AVAILABLE:
+            raise ImportError(
+                "`torch_graph_components` is required by "
+                "`GreedyContourPriorPartition`. Install/compile it before use."
+            )
+
         data_list = [data]
 
         for level, (reg, min_size) in enumerate(zip(self.reg, self.min_size)):

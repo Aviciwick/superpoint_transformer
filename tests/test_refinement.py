@@ -20,13 +20,8 @@ sys.path.insert(0, os.path.join(project_root, 'src'))
 import pytest
 import torch
 
-# 使用 importlib 加载模块
-import importlib.util
-refinement_path = os.path.join(project_root, 'src', 'Hybrid-SPT', 'ResidualRefinementHead', 'refinement.py')
-spec = importlib.util.spec_from_file_location('refinement', refinement_path)
-refinement_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(refinement_module)
-ResidualRefinementHead = refinement_module.ResidualRefinementHead
+# 直接从生产路径导入
+from src.hspt.rrh import ResidualRefinementHead
 
 
 class TestResidualRefinementHead:

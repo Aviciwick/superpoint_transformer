@@ -18,15 +18,10 @@ sys.path.insert(0, os.path.join(project_root, 'src'))
 
 import pytest
 import torch
+import math
 
 # 由于目录名包含空格和连字符，需要使用 importlib 加载模块
-import importlib.util
-import math
-sampler_path = os.path.join(project_root, 'src', 'Hybrid-SPT', 'AdaptiveUncertaintySampler', 'sampler.py')
-spec = importlib.util.spec_from_file_location('sampler', sampler_path)
-sampler_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(sampler_module)
-AdaptiveUncertaintySampler = sampler_module.AdaptiveUncertaintySampler
+from src.hspt.aus import AdaptiveUncertaintySampler
 
 
 class TestAdaptiveUncertaintySampler:

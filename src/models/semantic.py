@@ -292,8 +292,73 @@ class SemanticSegmentationModule(LightningModule):
                          f"n_sample={self.hspt_config.get('n_sample', 64)}, "
                          f"lambda_refine={self.hspt_lambda_refine}")
                 
-                # 初始化 H-SPT refine loss 指标
+                # 初始化 H-SPT refine loss 指标（train/val/test）
                 self.train_refine_loss = MeanMetric()
+                self.val_refine_loss = MeanMetric()
+                self.test_refine_loss = MeanMetric()
+                
+                # 异常熔断计数器
+                self._hspt_fail_count = 0
+                self._hspt_total_count = 0
+                self._hspt_consecutive_fail = 0
+                self._hspt_fuse_threshold = 10  # 连续失败 N 次后熔断
+
+                # AUS 几何特征通道定义契约
+                # 固定顺序：[linearity, planarity, scattering, verticality, ...]
+                self._geo_feature_keys = [
+                    'linearity', 'planarity', 'scattering', 'verticality',
+                    'curvature', 'length', 'surface', 'volume'
+                ]
+                self._geo_scatter_idx = 2  # scattering 在上述列表中的索引
+                self._geo_missing_warned = False
+
+    def _extract_handcrafted_features(self, nag) -> 'Optional[torch.Tensor]':
+        """
+        从 NAG Level 1 提取几何手工特征，返回固定顺序的张量。
+        
+        通道定义契约：[linearity, planarity, scattering, verticality, curvature, length, surface, volume]
+        缺失的字段补 0，且只在首次缺失时记录一次 warning。
+        
+        参数:
+            nag: NAG 对象
+        
+        返回:
+            handcrafted_features: [M, D_geo] 张量，或 None（无任何可用特征时）
+        """
+        if not hasattr(self, '_geo_feature_keys'):
+            return None
+        
+        sp_data = nag[1]
+        M = sp_data.num_nodes if hasattr(sp_data, 'num_nodes') else sp_data.pos.shape[0]
+        device = sp_data.pos.device
+        
+        features = []
+        missing_keys = []
+        for key in self._geo_feature_keys:
+            if hasattr(sp_data, key) and getattr(sp_data, key) is not None:
+                attr = getattr(sp_data, key)
+                if attr.dim() == 1:
+                    attr = attr.unsqueeze(-1)
+                features.append(attr.to(device))
+            else:
+                missing_keys.append(key)
+                features.append(torch.zeros(M, 1, device=device))
+        
+        # 首次缺失时记录 warning
+        if missing_keys and not self._geo_missing_warned:
+            log.warning(
+                f"AUS 几何特征缺失 {missing_keys}，对应通道补 0。"
+                f"如果全部缺失，AUS 将退化为纯语义熵采样。"
+            )
+            self._geo_missing_warned = True
+        
+        result = torch.cat(features, dim=-1)  # [M, D_geo]
+        
+        # 如果全部是零（全部缺失），返回 None 以避免 AUS 几何分支产生干扰
+        if len(missing_keys) == len(self._geo_feature_keys):
+            return None
+        
+        return result
 
     def cnn_weights_initialization(self) -> None:
         if not getattr(self.net.first_stage, 'cnn_blocks', False):
@@ -353,6 +418,7 @@ class SemanticSegmentationModule(LightningModule):
         # ===========================
         hspt_output = None
         if self.hspt_enabled and self.hspt is not None:
+            self._hspt_total_count += 1
             try:
                 # 获取超点质心
                 sp_centroids = nag[1].pos if hasattr(nag[1], 'pos') else None
@@ -366,6 +432,9 @@ class SemanticSegmentationModule(LightningModule):
                         device=sp_features.device
                     )
                     
+                    # 提取 AUS 几何特征（固定通道契约）
+                    handcrafted_feats = self._extract_handcrafted_features(nag)
+                    
                     # 运行 H-SPT 流水线
                     hspt_output = self.hspt(
                         sp_features=sp_features,
@@ -373,7 +442,7 @@ class SemanticSegmentationModule(LightningModule):
                         coarse_logits=coarse_logits,
                         packed_raw_points=packed_raw_points,
                         packed_mask=packed_mask,
-                        handcrafted_features=None  # 可选：从 nag[1] 获取几何特征
+                        handcrafted_features=handcrafted_feats
                     )
                     
                     # 使用融合后的特征重新计算 logits
@@ -383,8 +452,24 @@ class SemanticSegmentationModule(LightningModule):
                     
                     # 保存 packed_point_idx 供 loss 计算使用
                     hspt_output.packed_point_idx = packed_point_idx
+                    
+                    # 成功：重置连续失败计数
+                    self._hspt_consecutive_fail = 0
             except Exception as e:
-                log.warning(f"H-SPT 前向传播失败: {e}，回退到基线模式")
+                self._hspt_fail_count += 1
+                self._hspt_consecutive_fail += 1
+                
+                # 训练阶段连续失败超过阈值 → 熔断
+                if self.training and self._hspt_consecutive_fail >= self._hspt_fuse_threshold:
+                    raise RuntimeError(
+                        f"H-SPT 连续失败 {self._hspt_consecutive_fail} 次，触发熔断。"
+                        f"最近错误: {e}"
+                    )
+                
+                log.warning(
+                    f"H-SPT 前向传播失败 ({self._hspt_fail_count}/{self._hspt_total_count}): "
+                    f"{e}，回退到基线模式"
+                )
                 hspt_output = None
         
         # 构建最终 logits
@@ -609,6 +694,22 @@ class SemanticSegmentationModule(LightningModule):
 
         return loss, output
 
+    def _set_log_batch_size(self, batch: Any) -> None:
+        """Capture a stable batch size used by Lightning metric logging.
+
+        Our batches are nested/heterogeneous (NAG/Data), so Lightning's
+        automatic inference may pick the number of points instead of the
+        number of graphs/scenes.
+        """
+        candidate = batch[0] if isinstance(batch, (list, tuple)) and len(batch) > 0 else batch
+        batch_size = getattr(candidate, 'num_graphs', None)
+        if batch_size is None:
+            batch_size = 1
+        self._log_batch_size = int(batch_size)
+
+    def _batch_size_for_logging(self) -> int:
+        return int(getattr(self, '_log_batch_size', 1))
+
     def step_single_run_inference(self, nag: NAG) -> SemanticSegmentationOutput:
         """Single-run inference
         """
@@ -821,6 +922,7 @@ class SemanticSegmentationModule(LightningModule):
             batch: NAG,
             batch_idx: int
     ) -> torch.Tensor:
+        self._set_log_batch_size(batch)
         loss, output = self.model_step(batch)
 
         # Update and log metrics
@@ -845,28 +947,44 @@ class SemanticSegmentationModule(LightningModule):
         self.train_cm(
             output.semantic_pred().detach(),
             output.semantic_target.detach())
-        # H-SPT refine loss 指标更新
-        if self.hspt_enabled and hasattr(output, 'refine_loss'):
-            self.train_refine_loss(output.refine_loss.detach())
+        # H-SPT refine loss 指标更新（始终 update 避免 compute-before-update 警告）
+        if self.hspt_enabled:
+            if hasattr(output, 'refine_loss') and output.refine_loss is not None:
+                self.train_refine_loss(output.refine_loss.detach())
+            else:
+                self.train_refine_loss(torch.tensor(0.0, device=loss.device))
 
     def train_step_log_metrics(self) -> None:
         """Log train metrics after a single step with the content of the
         output object.
         """
+        batch_size = self._batch_size_for_logging()
         self.log(
             "train/loss",
             self.train_loss,
             on_step=False,
             on_epoch=True,
-            prog_bar=True)
-        # H-SPT refine loss 日志
+            prog_bar=True,
+            batch_size=batch_size)
+        # H-SPT refine loss 和 fail_rate 日志
         if self.hspt_enabled:
             self.log(
                 "train/refine_loss",
                 self.train_refine_loss,
                 on_step=False,
                 on_epoch=True,
-                prog_bar=False)
+                prog_bar=False,
+                batch_size=batch_size)
+            # 上报失败率
+            if self._hspt_total_count > 0:
+                fail_rate = self._hspt_fail_count / self._hspt_total_count
+                self.log(
+                    "train/hspt_fail_rate",
+                    fail_rate,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=batch_size)
 
     def on_train_epoch_end(self) -> None:
         self._on_train_epoch_end(
@@ -970,6 +1088,7 @@ class SemanticSegmentationModule(LightningModule):
             batch: NAG,
             batch_idx: int
     ) -> None:
+        self._set_log_batch_size(batch)
         loss, output = self.model_step(batch)
 
         # Update and log metrics
@@ -1012,14 +1131,30 @@ class SemanticSegmentationModule(LightningModule):
         self.val_cm(
             output.semantic_pred().detach(),
             output.semantic_target.detach())
+        # H-SPT val refine loss
+        if self.hspt_enabled:
+            if hasattr(output, 'refine_loss') and output.refine_loss is not None:
+                self.val_refine_loss(output.refine_loss.detach())
+            else:
+                self.val_refine_loss(torch.tensor(0.0, device=loss.device))
 
     def validation_step_log_metrics(self) -> None:
         """Log validation metrics after a single step with the content
         of the output object.
         """
+        batch_size = self._batch_size_for_logging()
         self.log(
             "val/loss", self.val_loss, on_step=False, on_epoch=True,
-            prog_bar=True)
+            prog_bar=True, batch_size=batch_size)
+        # H-SPT val refine loss 日志
+        if self.hspt_enabled:
+            self.log(
+                "val/refine_loss",
+                self.val_refine_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
 
     def _on_eval_epoch_end(
             self,
@@ -1182,6 +1317,7 @@ class SemanticSegmentationModule(LightningModule):
         self.on_fit_start()
 
     def test_step(self, batch: NAG, batch_idx: int) -> None:
+        self._set_log_batch_size(batch)
         loss, output = self.model_step(batch)
 
         # If the input batch does not have any labels (e.g. test set
@@ -1239,6 +1375,12 @@ class SemanticSegmentationModule(LightningModule):
         self.test_cm(
             output.semantic_pred().detach(),
             output.semantic_target.detach())
+        # H-SPT test refine loss
+        if self.hspt_enabled:
+            if hasattr(output, 'refine_loss') and output.refine_loss is not None:
+                self.test_refine_loss(output.refine_loss.detach())
+            else:
+                self.test_refine_loss(torch.tensor(0.0, device=loss.device))
 
     def test_step_log_metrics(self) -> None:
         """Log test metrics after a single step with the content of the
@@ -1249,17 +1391,27 @@ class SemanticSegmentationModule(LightningModule):
         if not self.test_has_target:
             return
         
+        batch_size = self._batch_size_for_logging()
         # As we don't prepare the train datasets, we cannot call
         # train_dataset.get_class_weight(), so the loss computation without
         # the proper weights is not possible.
         if not self.trainer.datamodule.hparams.prepare_only_test:
             self.log(
                 "test/loss", self.test_loss, on_step=False, on_epoch=True,
-                prog_bar=True)
+                prog_bar=True, batch_size=batch_size)
 
         self.log(
             "test/loss", self.test_loss, on_step=False, on_epoch=True,
-            prog_bar=True)
+            prog_bar=True, batch_size=batch_size)
+
+        if self.hspt_enabled:
+            self.log(
+                "test/refine_loss",
+                self.test_refine_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
 
     def on_test_epoch_end(self) -> None:
         self._on_eval_epoch_end(
@@ -1726,12 +1878,14 @@ class PartitionAndSemanticModule(SemanticSegmentationModule):
         if not self.training_partition_stage:
             return super().train_step_log_metrics()
         else:
+            batch_size = self._batch_size_for_logging()
             self.log(
                 "train/partition_loss",
                 self.train_partition_loss,
                 on_step=False,
                 on_epoch=True,
-                prog_bar=True)
+                prog_bar=True,
+                batch_size=batch_size)
 
     def on_train_epoch_end(self) -> None:
         if not self.training_partition_stage:
@@ -1767,19 +1921,22 @@ class PartitionAndSemanticModule(SemanticSegmentationModule):
             return super().validation_step_log_metrics()
 
         else:
+            batch_size = self._batch_size_for_logging()
             self.log(
                 "val/partition_loss",
                 self.val_partition_loss,
                 on_step=False,
                 on_epoch=True,
-                prog_bar=True)
+                prog_bar=True,
+                batch_size=batch_size)
 
             self.log(
                 "val/n_sp",
                 self.val_n_sp,
                 on_step=False,
                 on_epoch=True,
-                prog_bar=True)
+                prog_bar=True,
+                batch_size=batch_size)
 
     def on_validation_epoch_end(self) -> None:
         if not self.training_partition_stage:
@@ -1831,19 +1988,22 @@ class PartitionAndSemanticModule(SemanticSegmentationModule):
             if not self.test_has_target:
                 return
 
+            batch_size = self._batch_size_for_logging()
             self.log(
                 "test/partition_loss",
                 self.test_partition_loss,
                 on_step=False,
                 on_epoch=True,
-                prog_bar=True)
+                prog_bar=True,
+                batch_size=batch_size)
 
             self.log(
                 "test/n_sp",
                 self.test_n_sp,
                 on_step=False,
                 on_epoch=True,
-                prog_bar=True)
+                prog_bar=True,
+                batch_size=batch_size)
 
     def on_test_epoch_end(self) -> None:
         if not self.training_partition_stage:

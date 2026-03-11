@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List
 
 import hydra
+import torch
 from omegaconf import DictConfig
 from pytorch_lightning import Callback
 try:
@@ -14,6 +15,7 @@ except Exception:
         def log_hyperparams(self, *args, **kwargs):
             pass
 from pytorch_lightning.utilities import rank_zero_only
+from torch.nn.parameter import UninitializedParameter
 
 from src.utils import pylogger, rich_utils
 
@@ -165,14 +167,24 @@ def log_hyperparameters(object_dict: dict) -> None:
 
     hparams["model"] = cfg["model"]
 
+    def _safe_numel(p: torch.nn.Parameter) -> int:
+        # Lazy modules may hold UninitializedParameter before first forward.
+        return 0 if isinstance(p, UninitializedParameter) else p.numel()
+
+    params = list(model.parameters())
+    uninitialized_count = sum(
+        1 for p in params if isinstance(p, UninitializedParameter)
+    )
+
     # save number of model parameters
-    hparams["model/params/total"] = sum(p.numel() for p in model.parameters())
+    hparams["model/params/total"] = sum(_safe_numel(p) for p in params)
     hparams["model/params/trainable"] = sum(
-        p.numel() for p in model.parameters() if p.requires_grad
+        _safe_numel(p) for p in params if p.requires_grad
     )
     hparams["model/params/non_trainable"] = sum(
-        p.numel() for p in model.parameters() if not p.requires_grad
+        _safe_numel(p) for p in params if not p.requires_grad
     )
+    hparams["model/params/uninitialized"] = uninitialized_count
 
     hparams["datamodule"] = cfg["datamodule"]
     hparams["trainer"] = cfg["trainer"]

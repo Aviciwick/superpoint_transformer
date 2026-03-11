@@ -1,11 +1,27 @@
 import torch
 from torch_scatter import scatter_sum
-from torch_graph_components import wcc_by_max_propagation
-from torch_graph_components import merge_components_by_contour_prior
-from torch_graph_components.merge import component_graph
+
+# 延迟导入 torch_graph_components（该包需要单独编译安装）
+# 仅在实际调用相关函数时才触发 ImportError
+try:
+    from torch_graph_components import wcc_by_max_propagation
+    from torch_graph_components import merge_components_by_contour_prior
+    from torch_graph_components.merge import component_graph
+    _TGC_AVAILABLE = True
+except ImportError:
+    _TGC_AVAILABLE = False
 
 from src.data import NAG, Data, Cluster
 from src.utils.scatter import scatter_mean_weighted
+
+
+def _require_torch_graph_components() -> None:
+    """Ensure optional torch_graph_components dependency is available."""
+    if not _TGC_AVAILABLE:
+        raise ImportError(
+            "`torch_graph_components` is required for graph component merging. "
+            "Please install/compile it before using contour-prior partition helpers."
+        )
 
 
 def merge_components_by_contour_prior_on_data(
@@ -22,6 +38,9 @@ def merge_components_by_contour_prior_on_data(
 ) -> NAG:
     """Compute the weakly connected components of a graph by
     max-propagation.
+    
+    需要 torch_graph_components 包（C++ 扩展）。
+    若未安装，将抛出 ImportError。
     
     If the data object has a `super_index` attribute, the components that will
     be merged are the supernodes defined by `super_index`.
@@ -68,6 +87,7 @@ def merge_components_by_contour_prior_on_data(
         about the algorithm
     :type verbose: bool
     """
+    _require_torch_graph_components()
     
     assert data.x is not None
     assert data.pos is not None
@@ -138,6 +158,8 @@ def wcc_by_max_propagation_on_data(
     """Compute the weakly connected components of a graph by
     max-propagation.
     """
+    _require_torch_graph_components()
+
     # Compute connected components
     I, _ = wcc_by_max_propagation(
         data.num_nodes,

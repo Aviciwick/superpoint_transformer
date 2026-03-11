@@ -13,7 +13,7 @@ hspt:
   
   # CAFM (Cross-Attention Fusion Module) 参数
   n_sample: 64       # 每个超点采样的点数
-  d_raw: 3           # 原始点特征维度 (仅 XYZ)
+  d_raw: 6           # 原始点特征维度 (XYZ(3) + RGB(3))
   n_heads: 4         # 注意力头数
   dropout: 0.1       # Dropout 比率
   
@@ -27,3 +27,4 @@ hspt:
   use_padding_mask: true  # 是否使用 padding mask
   raw_keys:               # 用于构建 packed_raw_points 的属性键
     - pos
+    - rgb
