@@ -7,6 +7,7 @@ import hydra
 from src.utils.hydra import init_config
 from src.data import Data, InstanceData
 from src.transforms import instantiate_transforms
+from src.visualization.visualization import visualize_3d
 
 # Add project root to path
 sys.path.append(os.getcwd())
@@ -124,25 +125,70 @@ def save_cloud(path, nag):
         elif isinstance(data.obj_pred, np.ndarray):
             obj_pred = data.obj_pred
             
-    # Combine: x y z r g b semantic_label instance_label
-    # CloudCompare expects Scalar Field for label
-    output_data = np.column_stack([pos, rgb, pred, obj_pred])
+    # Extract multi-level superpoint indices
+    sp_indices = []
+    if isinstance(nag, list) or hasattr(nag, 'num_levels'):
+        num_levels = getattr(nag, 'num_levels') if hasattr(nag, 'num_levels') else len(nag)
+        current_sp = None
+        for i in range(num_levels - 1):
+            if hasattr(nag[i], 'super_index') and nag[i].super_index is not None:
+                if i == 0:
+                    current_sp = nag[i].super_index.cpu().numpy()
+                else:
+                    current_sp = nag[i].super_index.cpu().numpy()[current_sp]
+                sp_indices.append(current_sp)
     
-    # Format: xyz float, rgb int, labels int
-    fmt = '%.6f %.6f %.6f %d %d %d %d %d'
-    try:
-        np.savetxt(path, output_data, fmt=fmt)
-    except Exception as e:
-        print(f"Error saving with format: {e}. Falling back to default.")
-        np.savetxt(path, output_data)
+    # Combine: x y z r g b semantic_label instance_label [sp_level_1 ... sp_level_n]
+    sp_columns = [sp.reshape(-1, 1) for sp in sp_indices]
+    if sp_columns:
+        output_data = np.column_stack([pos, rgb, pred, obj_pred] + sp_columns)
+    else:
+        output_data = np.column_stack([pos, rgb, pred, obj_pred])
+    
+    # Dynamic format string
+    fmt_list = ['%.6f', '%.6f', '%.6f', '%d', '%d', '%d', '%d', '%d']
+    fmt_list.extend(['%d'] * len(sp_indices))
+    fmt = ' '.join(fmt_list)
+    
+    ext = os.path.splitext(path)[1].lower()
+    
+    if ext == '.ply':
+        # Add PLY magic numbers and header for CloudCompare
+        header_lines = [
+            "ply",
+            "format ascii 1.0",
+            f"element vertex {output_data.shape[0]}",
+            "property float x",
+            "property float y",
+            "property float z",
+            "property uchar red",
+            "property uchar green",
+            "property uchar blue",
+            "property int semantic_pred",
+            "property int obj_pred"
+        ]
+        for i in range(len(sp_indices)):
+            header_lines.append(f"property int sp_level_{i+1}")
+        header_lines.append("end_header")
+        header = "\n".join(header_lines)
+        
+        np.savetxt(path, output_data, fmt=fmt, header=header, comments='')
+    else:
+        try:
+            np.savetxt(path, output_data, fmt=fmt)
+        except Exception as e:
+            print(f"Error saving with format: {e}. Falling back to default.")
+            np.savetxt(path, output_data)
         
     print("Done.")
 
 def main():
     parser = argparse.ArgumentParser(description="Inference on a single room file")
     parser.add_argument('--input', required=True, help='Input point cloud file (.txt, .ply, .npy)')
-    parser.add_argument('--output', default='output/result_test.txt', help='Output txt file')
-    parser.add_argument('--ckpt', default='/workspace/exos_8t_0/jts/OpenIns3D_new/superpoint_transformer/logs/train/runs/2025-12-03_12-51-22/checkpoints/epoch_759.ckpt', help='Checkpoint path')
+    parser.add_argument('--output', default=None, help='Output txt file. By default, it creates <input_base>_pred.txt')
+    parser.add_argument('--ckpt', default='/workspace/exos_8t_0/jts/OpenIns3D_new/superpoint_transformer/logs/train/runs/2026-01-29_13-54-08/checkpoints/epoch_199.ckpt', help='Checkpoint path')
+    parser.add_argument('--experiment', default='panoptic/kitti360', help='Experiment name used flexibly for config. E.g., panoptic/s3dis, panoptic/kitti360, panoptic/scannet')
+    parser.add_argument('--visualize', action='store_true', help='Visualize results with superpoints using Plotly and save as HTML')
     args = parser.parse_args()
     
     if args.output is None:
@@ -155,12 +201,36 @@ def main():
     os.environ["PROJECT_ROOT"] = os.path.dirname(os.path.abspath(__file__))
     
     cfg = init_config(config_name="train.yaml", overrides=[
-        "experiment=panoptic/s3dis_with_stuff",
+        f"experiment={args.experiment}",
         "datamodule.dataloader.batch_size=1",
         "datamodule.dataloader.num_workers=0",
         f"ckpt_path={args.ckpt}"
     ])
     
+    # 动态解析数据集类别配置
+    dataset_name = args.experiment.split('/')[-1].lower()
+    if 's3dis' in dataset_name:
+        from src.datasets.s3dis_config import CLASS_NAMES, CLASS_COLORS, S3DIS_NUM_CLASSES, STUFF_CLASSES, STUFF_CLASSES_MODIFIED
+        class_names = CLASS_NAMES
+        class_colors = CLASS_COLORS
+        num_classes = S3DIS_NUM_CLASSES
+        stuff_classes = STUFF_CLASSES_MODIFIED if 'stuff' in dataset_name else STUFF_CLASSES
+    elif 'kitti' in dataset_name:
+        from src.datasets.kitti360_config import CLASS_NAMES, CLASS_COLORS, KITTI360_NUM_CLASSES, STUFF_CLASSES
+        class_names = CLASS_NAMES
+        class_colors = CLASS_COLORS
+        num_classes = KITTI360_NUM_CLASSES
+        stuff_classes = STUFF_CLASSES
+    elif 'scannet' in dataset_name:
+        from src.datasets.scannet_config import CLASS_NAMES, CLASS_COLORS, SCANNET_NUM_CLASSES, STUFF_CLASSES
+        class_names = CLASS_NAMES
+        class_colors = CLASS_COLORS
+        num_classes = SCANNET_NUM_CLASSES
+        stuff_classes = STUFF_CLASSES
+    else:
+        print(f"Warning: Unknown dataset in experiment '{args.experiment}'. Visualization colors might be incomplete.")
+        class_names, class_colors, num_classes, stuff_classes = None, None, None, None
+
     # 2. Instantiate Datamodule to get transforms
     print("Instantiating datamodule (for transforms)...")
     # datamodule = hydra.utils.instantiate(cfg.datamodule)
@@ -195,6 +265,9 @@ def main():
     
     # 5. Read Input
     nag = read_cloud(args.input)
+    if getattr(nag, 'pos', None) is not None and nag.pos.shape[0] == 0:
+        print(f"Error: The input point cloud '{args.input}' contains 0 points. Exiting.")
+        sys.exit(1)
     
     # 6. Transform
     print("Applying transforms...")
@@ -216,7 +289,7 @@ def main():
     # 7. Inference
     print("Running inference...")
     if hasattr(model, 'net'):
-        model.net.store_features = True # Required for some outputs?
+        model.net.store_features = True # Required for some outputs
         
     with torch.no_grad():
         output = model(nag)
@@ -242,6 +315,39 @@ def main():
     
     # 9. Save
     save_cloud(args.output, nag)
+
+    # 10. Visualize if requested
+    if args.visualize:
+        print("Generating visualization...")
+        # Move nag back to CPU for visualization
+        nag = nag.to('cpu')
+        
+        vis_output = visualize_3d(
+            nag,
+            class_names=class_names,
+            class_colors=class_colors,
+            stuff_classes=stuff_classes,
+            num_classes=num_classes,
+            max_points=100000,
+            centroids=True,     # 生成聚类超点中心可视化
+            h_edge=True,        # 可视化超点划分边缘连接
+            h_edge_width=2
+        )
+        
+        output_html = os.path.splitext(args.output)[0] + "_vis.html"
+        fig = vis_output['figure']
+
+        # Update layout to be responsive and full screen
+        fig.update_layout(
+            autosize=True,
+            width=None,
+            height=None,
+            margin=dict(l=0, r=0, b=0, t=0)
+        )
+
+        fig.write_html(output_html, config={'responsive': True})
+        print(f"Visualization HTML saved to {output_html}")
+
 
 if __name__ == "__main__":
     main()
