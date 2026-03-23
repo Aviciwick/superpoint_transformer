@@ -634,6 +634,21 @@ def visualize_3d(
         trace_modes[i_unselected_point_trace]['Features 3D'] = {
             'marker.color': colors[~data_0.selected], 'hovertext': None}
 
+    # Draw a trace for HSPT hard superpoints
+    if getattr(data_0, 'is_hspt_hard', None) is not None:
+        is_hard = data_0.is_hspt_hard.numpy()
+        colors = np.zeros((data_0.num_points, 3), dtype=np.uint8)
+        colors[is_hard] = [255, 0, 0]  # Red for hard
+        colors[~is_hard] = [200, 200, 200]  # Light gray for easy
+        colors = torch.from_numpy(colors)  # Fix: rgb_to_plotly_rgb expects a Tensor
+        colors = rgb_to_plotly_rgb(colors)
+        data_0.is_hspt_hard_colors = colors
+        text = np.array(["H-SPT Hard" if h else "H-SPT Easy" for h in is_hard])
+        trace_modes[i_point_trace]['H-SPT Hard'] = {
+            'marker.color': colors[data_0.selected], 'hovertext': text[data_0.selected]}
+        trace_modes[i_unselected_point_trace]['H-SPT Hard'] = {
+            'marker.color': colors[~data_0.selected], 'hovertext': text[~data_0.selected]}
+
     # Draw a trace for each key specified in keys. Only displays
     # point-wise tensor attributes that have not already been plotted
     # (ie not in `_DEFAULT_KEYS`)

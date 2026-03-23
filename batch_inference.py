@@ -89,10 +89,17 @@ def save_predictions(path: str, nag, dataset_name: str = None):
     
     data = nag[0]
     pos = data.pos.cpu().numpy()
-    rgb = data.rgb.cpu().numpy() if data.rgb is not None else np.zeros_like(pos)
     
-    if rgb.max() <= 1.0:
-        rgb = rgb * 255
+    if hasattr(data, 'pos_offset') and data.pos_offset is not None:
+        pos_offset = data.pos_offset.cpu().numpy()
+        pos = pos + pos_offset
+
+    if hasattr(data, 'rgb') and data.rgb is not None:
+        rgb = data.rgb.cpu().numpy()
+        if rgb.max() <= 1.0:
+            rgb = rgb * 255
+    else:
+        rgb = np.zeros_like(pos)
     
     if data.semantic_pred is not None:
         pred = data.semantic_pred.cpu().numpy()
@@ -129,13 +136,17 @@ def save_predictions(path: str, nag, dataset_name: str = None):
                 sp_indices.append(current_sp)
     
     sp_columns = [sp.reshape(-1, 1) for sp in sp_indices]
-    if sp_columns:
-        output_data = np.column_stack([pos, rgb, pred, obj_pred] + sp_columns)
-    else:
-        output_data = np.column_stack([pos, rgb, pred, obj_pred])
+    cols = [pos, rgb, pred, obj_pred] + sp_columns
+    if hasattr(data, 'is_hspt_hard'):
+        is_hard = data.is_hspt_hard.cpu().numpy().astype(np.int32).reshape(-1, 1)
+        cols.append(is_hard)
+        
+    output_data = np.column_stack(cols)
     
     fmt_list = ['%.6f', '%.6f', '%.6f', '%d', '%d', '%d', '%d', '%d']
     fmt_list.extend(['%d'] * len(sp_indices))
+    if hasattr(data, 'is_hspt_hard'):
+        fmt_list.append('%d')
     fmt = ' '.join(fmt_list)
     
     ext = os.path.splitext(path)[1].lower()
@@ -156,6 +167,8 @@ def save_predictions(path: str, nag, dataset_name: str = None):
         ]
         for i in range(len(sp_indices)):
             header_lines.append(f"property int sp_level_{i+1}")
+        if hasattr(data, 'is_hspt_hard'):
+            header_lines.append("property int is_hspt_hard")
         header_lines.append("end_header")
         header = "\n".join(header_lines)
         np.savetxt(path, output_data, fmt=fmt, header=header, comments='')
@@ -239,6 +252,14 @@ def run_inference_on_batch(model, batch, device):
     except Exception as e:
         pass
     
+    # 抽取 HSPT 困难超点标签
+    if hasattr(output, 'hspt_output') and output.hspt_output is not None:
+        if hasattr(batch, 'num_levels') and batch.num_levels >= 2:
+            super_idx = batch[0].super_index
+            hard_idx_l1 = output.hspt_output.hard_sp_indices
+            mask = torch.isin(super_idx, hard_idx_l1)
+            batch[0].is_hspt_hard = mask
+    
     return batch
 
 
@@ -273,16 +294,47 @@ def main():
     
     class_names, class_colors, num_classes, stuff_classes = get_dataset_config(args.experiment)
     
+    print(f"Loading checkpoint from {args.ckpt}...")
+    checkpoint = torch.load(args.ckpt, map_location='cpu')
+    hspt_enabled = any('hspt.' in k for k in checkpoint['state_dict'].keys())
+    
     print("Loading configuration...")
-    cfg = init_config(config_name="train.yaml", overrides=[
+    overrides = [
         f"experiment={args.experiment}",
         "datamodule.dataloader.batch_size=1",
         "datamodule.dataloader.num_workers=0",
         f"ckpt_path={args.ckpt}"
-    ])
+    ]
+    if hspt_enabled:
+        print("Detected H-SPT weights, enabling model.hspt.enable=True")
+        overrides.append("model.hspt.enable=True")
+        
+        # Auto-detect HSPT d_raw from checkpoint
+        d_raw = 6
+        for k, v in checkpoint['state_dict'].items():
+            if 'hspt.cafm.point_encoder.0.weight' in k:
+                d_raw = v.shape[1]
+                break
+                
+        if d_raw == 3:
+            print("Auto-detected HSPT raw_keys=['pos'] from checkpoint")
+            overrides.append("model.hspt.raw_keys=[pos]")
+            overrides.append("model.hspt.d_raw=3")
+        elif d_raw == 6:
+            print("Auto-detected HSPT raw_keys=['pos','rgb'] from checkpoint")
+            overrides.append("model.hspt.raw_keys=[pos,rgb]")
+            overrides.append("model.hspt.d_raw=6")
+        
+    cfg = init_config(config_name="train.yaml", overrides=overrides)
     
     print("Instantiating datamodule...")
     datamodule = hydra.utils.instantiate(cfg.datamodule)
+    
+    # Force loading 'rgb' if it's missing (e.g., in KITTI-360 config which uses HSV)
+    if hasattr(datamodule, 'kwargs') and 'point_load_keys' in datamodule.kwargs:
+        if datamodule.kwargs['point_load_keys'] is not None and 'rgb' not in datamodule.kwargs['point_load_keys']:
+            datamodule.kwargs['point_load_keys'] = list(datamodule.kwargs['point_load_keys']) + ['rgb']
+            
     datamodule.setup(stage=args.stage)
     
     print("Instantiating model...")
@@ -292,8 +344,6 @@ def main():
     if on_device_transform is None:
         on_device_transform = getattr(datamodule, 'on_device_val_transform', None)
     
-    print(f"Loading checkpoint from {args.ckpt}...")
-    checkpoint = torch.load(args.ckpt, map_location='cpu')
     model.load_state_dict(checkpoint['state_dict'])
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
