@@ -30,7 +30,7 @@ from torch_geometric.nn.pool.consecutive import consecutive_cluster
 from src.utils import init_weights, PanopticSegmentationOutput, \
     PartitionParameterSearchStorage
 from src.metrics import MeanAveragePrecision3D, PanopticQuality3D, \
-    ConfusionMatrix
+    ConfusionMatrix, BoundaryPanopticQuality3D
 from src.models.semantic import SemanticSegmentationModule
 from src.loss import BCEWithLogitsLoss
 from src.data import NAG
@@ -226,6 +226,7 @@ class PanopticSegmentationModule(SemanticSegmentationModule):
             partition_every_n_epoch: int = 50,
             no_instance_metrics: bool = True,
             no_instance_metrics_on_train_set: bool = True,
+            boundary_distance: float = 0.1,
             **kwargs):
         super().__init__(
             net,
@@ -338,9 +339,29 @@ class PanopticSegmentationModule(SemanticSegmentationModule):
             remove_void=True,
             **kwargs)
 
+        # Boundary Panoptic 指标（仅 val/test，不参与训练）
+        self.boundary_distance = boundary_distance
+        self.val_boundary_panoptic = BoundaryPanopticQuality3D(
+            self.num_classes,
+            boundary_distance=boundary_distance,
+            stuff_classes=self.stuff_classes,
+            ignore_unseen_classes=True,
+            compute_on_cpu=True,
+            **kwargs)
+        self.test_boundary_panoptic = BoundaryPanopticQuality3D(
+            self.num_classes,
+            boundary_distance=boundary_distance,
+            stuff_classes=self.stuff_classes,
+            ignore_unseen_classes=True,
+            compute_on_cpu=True,
+            **kwargs)
+
         # Storage to accumulate multiple batch partition predictions, to
         # be used when searching for the best partition setting
         self.train_multi_partition_storage = []
+
+        # 临时属性：在 step 和 update_metrics 之间传递 NAG
+        self._current_nag = None
 
         # Metric objects for calculating node offset prediction scores
         # on each dataset split
@@ -667,6 +688,7 @@ class PanopticSegmentationModule(SemanticSegmentationModule):
         self.val_panoptic.reset()
         self.val_semantic.reset()
         self.val_instance.reset()
+        self.val_boundary_panoptic.reset()
         # self.val_offset_wl2.reset()
         # self.val_offset_wl1.reset()
         # self.val_offset_l2.reset()
@@ -850,6 +872,13 @@ class PanopticSegmentationModule(SemanticSegmentationModule):
             self,
             batch: NAG
     ) -> Tuple[torch.Tensor, PanopticSegmentationOutput]:
+        """前向传播并计算损失。
+
+        同时暂存 NAG 引用到 _current_nag，供 boundary 指标使用。
+        """
+        # 暂存 NAG 以供 boundary 指标的 update_metrics 使用
+        self._current_nag = batch
+
         # Loss and predictions for semantic segmentation
         semantic_loss, output = super().model_step(batch)
 
@@ -883,6 +912,98 @@ class PanopticSegmentationModule(SemanticSegmentationModule):
         output.edge_affinity_loss = edge_affinity_loss
 
         return loss, output
+
+    def _update_boundary_metrics(
+            self,
+            boundary_metric: 'BoundaryPanopticQuality3D',
+            output: PanopticSegmentationOutput,
+    ) -> None:
+        """从当前 NAG 和模型输出中提取体素级数据，更新 boundary 指标。
+
+        数据提取步骤：
+        1. 从 self._current_nag[0].pos 获取体素坐标
+        2. 通过 InstanceData.major() 获取超点级 GT 实例 ID，
+           再经 super_index 传播到体素级
+        3. 通过 output.voxel_panoptic_pred() 获取体素级预测
+
+        Args:
+            boundary_metric: BoundaryPanopticQuality3D 指标对象。
+            output: PanopticSegmentationOutput 模型输出。
+        """
+        nag = self._current_nag
+        if nag is None:
+            return
+
+        # 检查 level 0 数据是否可用
+        if not nag.has_atoms:
+            return
+
+        try:
+            super_index = nag[0].super_index
+            point_coords = nag[0].pos.detach()
+
+            # GT 实例 ID：从 level-1 InstanceData 获取超点级主实例，
+            # 再传播到体素级
+            gt_obj, gt_count, gt_y = output.obj.major(
+                num_classes=self.num_classes)
+            gt_instance_ids = gt_obj[super_index]
+            gt_semantic = gt_y[super_index]
+
+            # Pred 实例 ID 和语义标签：通过 voxel_panoptic_pred 获取
+            vox_y, vox_index, _ = output.voxel_panoptic_pred(
+                super_index=super_index)
+            pred_instance_ids = vox_index.detach()
+            pred_semantic = vox_y.detach()
+
+            boundary_metric.update(
+                point_coords,
+                gt_instance_ids,
+                gt_semantic,
+                pred_instance_ids,
+                pred_semantic,
+            )
+        except Exception as e:
+            log.warning(
+                f"BoundaryPanopticQuality3D 更新失败: {e}")
+
+    def _log_boundary_metrics(
+            self,
+            stage: str,
+            boundary_metric: 'BoundaryPanopticQuality3D',
+    ) -> None:
+        """计算并记录 boundary panoptic 指标到 self.log（含 wandb）。
+
+        Args:
+            stage: str
+                当前阶段，'val' 或 'test'。
+            boundary_metric: BoundaryPanopticQuality3D 指标对象。
+        """
+        try:
+            results = boundary_metric.compute()
+
+            # 记录全局指标
+            self.log(f"{stage}/bpq", 100 * results.bpq, prog_bar=True)
+            self.log(f"{stage}/bsq", 100 * results.bsq, prog_bar=True)
+            self.log(f"{stage}/brq", 100 * results.brq, prog_bar=True)
+            self.log(f"{stage}/biou", 100 * results.biou, prog_bar=True)
+            self.log(
+                f"{stage}/bpq_thing", 100 * results.bpq_thing,
+                prog_bar=True)
+            self.log(
+                f"{stage}/bpq_stuff", 100 * results.bpq_stuff,
+                prog_bar=True)
+
+            # 记录逐类别指标
+            for bpq_c, name in zip(
+                    results.bpq_per_class, self.class_names):
+                if not torch.isnan(bpq_c):
+                    self.log(
+                        f"{stage}/bpq_{name}", 100 * bpq_c,
+                        prog_bar=True)
+
+        except Exception as e:
+            log.warning(
+                f"BoundaryPanopticQuality3D 计算/记录失败: {e}")
 
     def train_step_update_metrics(
             self,
@@ -1162,6 +1283,10 @@ class PanopticSegmentationModule(SemanticSegmentationModule):
             if self.needs_instance:
                 self.val_instance.update(obj_score, obj_y, instance_data.cpu())
 
+            # 更新 Boundary Panoptic 指标
+            self._update_boundary_metrics(
+                self.val_boundary_panoptic, output)
+
         # Update tracked losses
         self.val_semantic_loss(output.semantic_loss.detach())
         # self.val_node_offset_loss(output.node_offset_loss.detach())
@@ -1261,6 +1386,9 @@ class PanopticSegmentationModule(SemanticSegmentationModule):
                 for map_c, name in zip(map_per_class, self.class_names):
                     self.log(f"val/map_{name}", 100 * map_c, prog_bar=True)
 
+            # 计算并记录 Boundary Panoptic 指标
+            self._log_boundary_metrics('val', self.val_boundary_panoptic)
+
             # Update best-so-far metrics
             self.val_pq_best(pq)
             self.val_pqmod_best(pqmod)
@@ -1329,6 +1457,7 @@ class PanopticSegmentationModule(SemanticSegmentationModule):
         self.val_panoptic.reset()
         self.val_semantic.reset()
         self.val_instance.reset()
+        self.val_boundary_panoptic.reset()
 
     def test_step_update_metrics(
             self,
@@ -1355,6 +1484,10 @@ class PanopticSegmentationModule(SemanticSegmentationModule):
             self.test_semantic(obj_y, obj_hist)
             if self.needs_instance:
                 self.test_instance.update(obj_score, obj_y, instance_data.cpu())
+
+            # 更新 Boundary Panoptic 指标
+            self._update_boundary_metrics(
+                self.test_boundary_panoptic, output)
 
         # Update tracked losses
         self.test_semantic_loss(output.semantic_loss.detach())
@@ -1415,6 +1548,7 @@ class PanopticSegmentationModule(SemanticSegmentationModule):
             self.test_affinity_f1.reset()
             self.test_panoptic.reset()
             self.test_semantic.reset()
+            self.test_boundary_panoptic.reset()
             self.test_instance.reset()
             return
 
@@ -1471,6 +1605,9 @@ class PanopticSegmentationModule(SemanticSegmentationModule):
                 for map_c, name in zip(map_per_class, self.class_names):
                     self.log(f"test/map_{name}", 100 * map_c, prog_bar=True)
 
+            # 计算并记录 Boundary Panoptic 指标
+            self._log_boundary_metrics('test', self.test_boundary_panoptic)
+
         # Log metrics
         # self.log("test/offset_wl2", self.test_offset_wl2.compute(), prog_bar=True)
         # self.log("test/offset_wl1", self.test_offset_wl1.compute(), prog_bar=True)
@@ -1489,6 +1626,7 @@ class PanopticSegmentationModule(SemanticSegmentationModule):
         self.test_panoptic.reset()
         self.test_semantic.reset()
         self.test_instance.reset()
+        self.test_boundary_panoptic.reset()
 
     def track_batch(
             self,
