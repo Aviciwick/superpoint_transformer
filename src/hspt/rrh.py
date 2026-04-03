@@ -62,6 +62,9 @@ class ResidualRefinementHead(nn.Module):
         d_model: int = 64,
         num_classes: int = 13,
         hidden_dim: Optional[int] = None,
+        mlp_ratio: float = 4.0,
+        num_layers: int = 3,
+        use_gated_fusion: bool = True,
         dropout: float = 0.1
     ):
         """
@@ -70,7 +73,10 @@ class ResidualRefinementHead(nn.Module):
         参数:
             d_model: 特征维度，默认 64
             num_classes: 分类类别数，默认 13
-            hidden_dim: MLP 中间层维度，默认等于 d_model
+            hidden_dim: MLP 中间层维度，默认按 mlp_ratio * d_model
+            mlp_ratio: 隐层扩展比例（hidden_dim 未显式指定时生效）
+            num_layers: 细化 MLP 层数（>=2）
+            use_gated_fusion: 是否启用门控残差融合
             dropout: Dropout 比率，默认 0.1
         """
         super().__init__()
@@ -78,23 +84,44 @@ class ResidualRefinementHead(nn.Module):
         # 参数验证
         assert d_model > 0, f"d_model 必须为正整数，当前值: {d_model}"
         assert num_classes > 0, f"num_classes 必须为正整数，当前值: {num_classes}"
+        assert mlp_ratio > 0, f"mlp_ratio 必须为正数，当前值: {mlp_ratio}"
+        assert num_layers >= 2, f"num_layers 必须 >= 2，当前值: {num_layers}"
         
         self.d_model = d_model
         self.num_classes = num_classes
-        hidden_dim = hidden_dim or d_model
+        self.num_layers = num_layers
+        self.use_gated_fusion = use_gated_fusion
+        hidden_dim = hidden_dim or int(round(d_model * mlp_ratio))
+        hidden_dim = max(hidden_dim, d_model)
+        self.hidden_dim = hidden_dim
         
         # ===========================
         # 残差预测 MLP
         # ===========================
         # 输入: [K, N, 2*D] (超点特征 + 点特征拼接)
         # 输出: [K, N, C] (delta logits)
-        self.refinement_head = nn.Sequential(
-            nn.Linear(d_model * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(inplace=True),  # inplace 优化显存
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes)
-        )
+        layers = []
+        in_dim = d_model * 2
+        for _ in range(num_layers - 1):
+            layers.extend([
+                nn.Linear(in_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ])
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, num_classes))
+        self.refinement_head = nn.Sequential(*layers)
+
+        # 门控分支：学习每个点的细化强度（0~1）
+        if use_gated_fusion:
+            gate_hidden = max(hidden_dim // 2, 16)
+            self.gate_head = nn.Sequential(
+                nn.Linear(d_model * 2, gate_hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(gate_hidden, 1)
+            )
     
     def forward(
         self,
@@ -195,8 +222,11 @@ class ResidualRefinementHead(nn.Module):
         if use_residual:
             # Base Logits: [K, C] -> [K, 1, C] (广播到 N 个点)
             base_logits = coarse_logits.unsqueeze(1)
-            # Final = Base + Delta
-            point_logits = base_logits + delta_logits
+            if self.use_gated_fusion:
+                gate = torch.sigmoid(self.gate_head(combined_features))
+                point_logits = base_logits + gate * delta_logits
+            else:
+                point_logits = base_logits + delta_logits
         else:
             # 纯预测模式
             point_logits = delta_logits
@@ -205,7 +235,11 @@ class ResidualRefinementHead(nn.Module):
     
     def extra_repr(self) -> str:
         """返回模块的额外表示信息。"""
-        return f"d_model={self.d_model}, num_classes={self.num_classes}"
+        return (
+            f"d_model={self.d_model}, num_classes={self.num_classes}, "
+            f"hidden_dim={self.hidden_dim}, num_layers={self.num_layers}, "
+            f"use_gated_fusion={self.use_gated_fusion}"
+        )
 
 
 def demo_usage():

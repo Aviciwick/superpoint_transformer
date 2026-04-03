@@ -15,13 +15,20 @@ hspt:
   n_sample: 64       # 每个超点采样的点数
   d_raw: 6           # 原始点特征维度 (XYZ(3) + RGB(3))
   n_heads: 4         # 注意力头数
+  cafm_query_mode: point  # point: 多token查询, single: 单token回退
+  cafm_point_fusion_weight: 1.0  # 点特征注意力残差融合权重
   dropout: 0.1       # Dropout 比率
   
   # RRH (Residual Refinement Head) 参数
   use_residual: true # 是否使用残差模式 (Final = Base + Delta)
+  rrh_hidden_dim: null  # null 时按 rrh_mlp_ratio * d_model 自动推导
+  rrh_mlp_ratio: 4.0    # RRH 隐层扩展比例
+  rrh_num_layers: 3     # RRH MLP 层数（>=2）
+  rrh_use_gated_fusion: true  # 是否启用门控残差融合
   
   # Loss 参数
   lambda_refine: 0.5 # refine loss 权重
+  logit_fusion_alpha: 0.5  # 将点级细化结果融合回 superpoint logits 的系数
   
   # 高级选项
   use_padding_mask: true  # 是否使用 padding mask

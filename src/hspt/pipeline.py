@@ -246,7 +246,13 @@ class HSPTModule(nn.Module):
         n_sample: 每个超点采样的点数，默认 64
         d_raw: 原始点特征维度，默认 6
         n_heads: CAFM 注意力头数，默认 4
+        cafm_query_mode: CAFM 查询模式，point 或 single
+        cafm_point_fusion_weight: CAFM 点特征残差融合权重
         use_residual: 是否使用残差模式，默认 True
+        rrh_hidden_dim: RRH 隐层维度（None 时按 rrh_mlp_ratio 自动计算）
+        rrh_mlp_ratio: RRH 隐层扩展比例
+        rrh_num_layers: RRH MLP 层数
+        rrh_use_gated_fusion: RRH 是否启用门控融合
         dropout: Dropout 比率，默认 0.1
     """
     
@@ -258,10 +264,17 @@ class HSPTModule(nn.Module):
         n_sample: int = 64,
         d_raw: int = 6,
         n_heads: int = 4,
+        cafm_query_mode: str = 'point',
+        cafm_point_fusion_weight: float = 1.0,
         use_residual: bool = True,
+        rrh_hidden_dim: Optional[int] = None,
+        rrh_mlp_ratio: float = 4.0,
+        rrh_num_layers: int = 3,
+        rrh_use_gated_fusion: bool = True,
         dropout: float = 0.1,
         alpha: float = 0.7,
-        beta: float = 0.3
+        beta: float = 0.3,
+        **kwargs
     ):
         super().__init__()
         
@@ -281,13 +294,19 @@ class HSPTModule(nn.Module):
             d_model=d_model,
             n_heads=n_heads,
             d_raw=d_raw,
-            dropout=dropout
+            dropout=dropout,
+            query_mode=kwargs.get('query_mode', 'point'),
+            use_ffn=kwargs.get('use_ffn', False)
         )
         
         self.rrh = ResidualRefinementHead(
             d_model=d_model,
             num_classes=num_classes,
-            dropout=dropout
+            dropout=dropout,
+            hidden_dim=kwargs.get('hidden_dim', rrh_hidden_dim),
+            mlp_ratio=kwargs.get('mlp_ratio', rrh_mlp_ratio),
+            num_layers=kwargs.get('num_layers', rrh_num_layers),
+            use_gated_fusion=kwargs.get('use_gated_fusion', rrh_use_gated_fusion)
         )
     
     def forward(

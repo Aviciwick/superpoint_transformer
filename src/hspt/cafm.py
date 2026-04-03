@@ -21,11 +21,9 @@
     5. 全局回填 (Scatter Update): 将增强特征写回全局特征图
 """
 
-import math
 import warnings
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Tuple, Optional
 
 
@@ -67,7 +65,9 @@ class CrossAttentionFusionModule(nn.Module):
         d_raw: int = 6,
         n_heads: int = 4,
         dropout: float = 0.1,
-        use_ffn: bool = False
+        use_ffn: bool = False,
+        query_mode: str = 'point',
+        point_fusion_weight: float = 1.0
     ):
         """
         初始化交叉注意力融合模块。
@@ -85,9 +85,15 @@ class CrossAttentionFusionModule(nn.Module):
         assert d_model > 0, f"d_model 必须为正整数，当前值: {d_model}"
         assert d_model % n_heads == 0, \
             f"d_model ({d_model}) 必须能被 n_heads ({n_heads}) 整除"
+        assert query_mode in ('point', 'single'), \
+            f"query_mode 必须是 'point' 或 'single'，当前值: {query_mode}"
+        assert point_fusion_weight >= 0, \
+            f"point_fusion_weight 必须非负，当前值: {point_fusion_weight}"
         
         self.d_model = d_model
         self.n_heads = n_heads
+        self.query_mode = query_mode
+        self.point_fusion_weight = point_fusion_weight
         self._materialized_d_raw = None  # 材化后记录的实际 d_raw
         
         # ===========================
@@ -117,6 +123,8 @@ class CrossAttentionFusionModule(nn.Module):
         # ===========================
         self.norm1 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
+        self.point_norm = nn.LayerNorm(d_model)
+        self.point_dropout = nn.Dropout(dropout)
         
         # ===========================
         # 4. 可选 FFN 层
@@ -273,29 +281,59 @@ class CrossAttentionFusionModule(nn.Module):
         # 保存这个 point_features_k 供 Module 3 使用！
         point_features_k = self.point_encoder(point_input)
         
+        # key_padding_mask 设备/类型/形状校验
+        if key_padding_mask is not None:
+            if key_padding_mask.device != device:
+                key_padding_mask = key_padding_mask.to(device)
+            if key_padding_mask.dtype != torch.bool:
+                key_padding_mask = key_padding_mask.to(torch.bool)
+            if key_padding_mask.shape != (K, N):
+                raise ValueError(
+                    f"key_padding_mask 形状必须是 ({K}, {N})，"
+                    f"实际: {tuple(key_padding_mask.shape)}"
+                )
+
         # ===========================
-        # 步骤 4: 交叉注意力 (Cross-Attention)
+        # 步骤 4: 注意力融合
         # ===========================
-        # Query: 超点特征 [K, D] -> [K, 1, D]
-        # Key/Value: 点特征 [K, N, D]
-        query = sp_feat_k.unsqueeze(1)
-        
-        attn_out, _ = self.cross_attn(
-            query=query,
-            key=point_features_k,
-            value=point_features_k,
-            key_padding_mask=key_padding_mask
-        )
-        # attn_out: [K, 1, D]
-        
+        # 默认使用点级多 token query，避免单 token 信息瓶颈。
+        if self.query_mode == 'point':
+            # Query/Key/Value 均为点特征，输出 [K, N, D]
+            point_attn_out, _ = self.cross_attn(
+                query=point_features_k,
+                key=point_features_k,
+                value=point_features_k,
+                key_padding_mask=key_padding_mask
+            )
+            point_features_k = self.point_norm(
+                point_features_k + self.point_fusion_weight * self.point_dropout(point_attn_out)
+            )
+
+            # 将增强后的点特征池化为超点上下文 [K, D]
+            if key_padding_mask is None:
+                super_residual = point_features_k.mean(dim=1)
+            else:
+                valid_mask = (~key_padding_mask).unsqueeze(-1).to(point_features_k.dtype)
+                valid_count = valid_mask.sum(dim=1).clamp(min=1.0)
+                super_residual = (point_features_k * valid_mask).sum(dim=1) / valid_count
+        else:
+            # 回退模式：保留单 token Query 行为
+            attn_out, _ = self.cross_attn(
+                query=sp_feat_k.unsqueeze(1),
+                key=point_features_k,
+                value=point_features_k,
+                key_padding_mask=key_padding_mask
+            )
+            super_residual = attn_out.squeeze(1)  # [K, D]
+            point_features_k = self.point_norm(
+                point_features_k
+                + self.point_fusion_weight * self.point_dropout(super_residual.unsqueeze(1).expand(-1, N, -1))
+            )
+
         # ===========================
         # 步骤 5: 残差融合
         # ===========================
-        # Squeeze dim 1: [K, 1, D] -> [K, D]
-        attn_out = attn_out.squeeze(1)
-        
-        # 残差连接 + LayerNorm
-        enhanced_feat_k = self.norm1(sp_feat_k + self.dropout(attn_out))
+        enhanced_feat_k = self.norm1(sp_feat_k + self.dropout(super_residual))
         
         # 可选 FFN
         if self.use_ffn:
@@ -319,7 +357,8 @@ class CrossAttentionFusionModule(nn.Module):
         d_raw_str = self._materialized_d_raw if self._materialized_d_raw is not None else "dynamic"
         return (
             f"d_model={self.d_model}, d_raw={d_raw_str}, "
-            f"n_heads={self.n_heads}, use_ffn={self.use_ffn}"
+            f"n_heads={self.n_heads}, query_mode={self.query_mode}, "
+            f"point_fusion_weight={self.point_fusion_weight}, use_ffn={self.use_ffn}"
         )
 
 

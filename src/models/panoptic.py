@@ -554,6 +554,15 @@ class PanopticSegmentationModule(SemanticSegmentationModule):
 
                     # 保存 packed_point_idx 供 loss 计算使用
                     hspt_output.packed_point_idx = packed_point_idx
+
+                    # 将点级细化结果回注到 superpoint 语义 logits
+                    coarse_logits = self._fuse_hspt_superpoint_logits(
+                        semantic_pred[0] if self.multi_stage_loss else semantic_pred,
+                        hspt_output)
+                    if self.multi_stage_loss:
+                        semantic_pred[0] = coarse_logits
+                    else:
+                        semantic_pred = coarse_logits
                     
                     # 成功：重置连续失败计数
                     self._hspt_consecutive_fail = 0

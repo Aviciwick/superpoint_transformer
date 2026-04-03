@@ -176,3 +176,6 @@ wandb
 output/*
 *.html
 *.out
+
+#论文相关
+期刊论文撰写/*

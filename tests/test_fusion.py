@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(project_root, 'src'))
 
 import pytest
 import torch
+from unittest.mock import patch
 
 # 直接从生产路径导入
 from src.hspt.cafm import CrossAttentionFusionModule
@@ -71,6 +72,36 @@ class TestCrossAttentionFusionModule:
             f"point_features_K 形状错误: 期望 ({K}, {N}, {D}), 实际 {point_feats.shape}"
         assert fused.shape == (M, D), \
             f"fused_global_features 形状错误: 期望 ({M}, {D}), 实际 {fused.shape}"
+
+    def test_point_query_uses_multi_token(self, module, sample_data):
+        """验证默认点级查询模式下，query token 数等于点数 N。"""
+        hard_indices, features, centroids, points = sample_data
+        expected_n = points.shape[1]
+
+        module.eval()
+        with patch.object(module.cross_attn, 'forward', wraps=module.cross_attn.forward) as mocked:
+            with torch.no_grad():
+                module(hard_indices, features, centroids, points)
+
+        query = mocked.call_args.kwargs['query']
+        assert query.shape[1] == expected_n, \
+            f"query token 数错误: 期望 {expected_n}, 实际 {query.shape[1]}"
+
+    def test_point_features_are_attention_enhanced(self, module, sample_data):
+        """验证返回的点特征不是纯编码输出，而是经过注意力增强。"""
+        hard_indices, features, centroids, points = sample_data
+
+        module.eval()
+        with torch.no_grad():
+            k_centroids = centroids[hard_indices]
+            k_points = points[hard_indices]
+            local_xyz = k_points[..., :3] - k_centroids.unsqueeze(1)
+            point_input = torch.cat([local_xyz, k_points[..., 3:]], dim=-1)
+            encoded_only = module.point_encoder(point_input)
+            _, point_feats, _ = module(hard_indices, features, centroids, points)
+
+        diff = (point_feats - encoded_only).abs().mean().item()
+        assert diff > 1e-6, f"点特征未被增强，平均差异过小: {diff:.3e}"
     
     # ==========================================
     # 2. 坐标局部化测试

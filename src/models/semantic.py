@@ -281,16 +281,24 @@ class SemanticSegmentationModule(LightningModule):
                     n_sample=self.hspt_config.get('n_sample', 64),
                     d_raw=self.hspt_config.get('d_raw', 3),
                     n_heads=self.hspt_config.get('n_heads', 4),
+                    cafm_query_mode=self.hspt_config.get('cafm_query_mode', 'point'),
+                    cafm_point_fusion_weight=self.hspt_config.get('cafm_point_fusion_weight', 1.0),
                     use_residual=self.hspt_config.get('use_residual', True),
+                    rrh_hidden_dim=self.hspt_config.get('rrh_hidden_dim', None),
+                    rrh_mlp_ratio=self.hspt_config.get('rrh_mlp_ratio', 4.0),
+                    rrh_num_layers=self.hspt_config.get('rrh_num_layers', 3),
+                    rrh_use_gated_fusion=self.hspt_config.get('rrh_use_gated_fusion', True),
                     dropout=self.hspt_config.get('dropout', 0.1),
                     alpha=self.hspt_config.get('alpha', 0.7),
                     beta=self.hspt_config.get('beta', 0.3)
                 )
                 self.hspt_lambda_refine = self.hspt_config.get('lambda_refine', 0.5)
+                self.hspt_logit_fusion_alpha = self.hspt_config.get('logit_fusion_alpha', 0.5)
                 self.hspt_raw_keys = self.hspt_config.get('raw_keys', ['pos'])
                 log.info(f"H-SPT 模块已启用: topk_ratio={self.hspt_config.get('topk_ratio', 0.2)}, "
                          f"n_sample={self.hspt_config.get('n_sample', 64)}, "
-                         f"lambda_refine={self.hspt_lambda_refine}")
+                         f"lambda_refine={self.hspt_lambda_refine}, "
+                         f"logit_fusion_alpha={self.hspt_logit_fusion_alpha}")
                 
                 # 初始化 H-SPT refine loss 指标（train/val/test）
                 self.train_refine_loss = MeanMetric()
@@ -311,6 +319,38 @@ class SemanticSegmentationModule(LightningModule):
                 ]
                 self._geo_scatter_idx = 2  # scattering 在上述列表中的索引
                 self._geo_missing_warned = False
+
+    def _fuse_hspt_superpoint_logits(
+            self,
+            coarse_logits: torch.Tensor,
+            hspt_output) -> torch.Tensor:
+        """融合 H-SPT 点级预测到 superpoint logits。
+
+        仅对困难超点区域进行融合，避免影响整图稳定性。
+        """
+        alpha = float(getattr(self, 'hspt_logit_fusion_alpha', 0.0))
+        if alpha <= 0.0 or hspt_output is None:
+            return coarse_logits
+
+        point_logits = getattr(hspt_output, 'point_logits', None)
+        hard_sp_indices = getattr(hspt_output, 'hard_sp_indices', None)
+        if point_logits is None or hard_sp_indices is None or point_logits.numel() == 0:
+            return coarse_logits
+
+        if point_logits.dim() != 3:
+            return coarse_logits
+
+        # [K, N, C] -> [K, C]
+        refined_sp_logits = point_logits.mean(dim=1)
+        if refined_sp_logits.shape[0] != hard_sp_indices.numel():
+            return coarse_logits
+
+        fused_logits = coarse_logits.clone()
+        fused_logits[hard_sp_indices] = (
+            (1.0 - alpha) * fused_logits[hard_sp_indices]
+            + alpha * refined_sp_logits
+        )
+        return fused_logits
 
     def _extract_handcrafted_features(self, nag) -> 'Optional[torch.Tensor]':
         """
@@ -449,6 +489,9 @@ class SemanticSegmentationModule(LightningModule):
                     if hspt_output.fused_features is not None:
                         sp_features = hspt_output.fused_features
                         coarse_logits = self.head[0](sp_features) if self.multi_stage_loss else self.head(sp_features)
+
+                    # 将点级细化结果回注到 superpoint logits（训练/推理一致）
+                    coarse_logits = self._fuse_hspt_superpoint_logits(coarse_logits, hspt_output)
                     
                     # 保存 packed_point_idx 供 loss 计算使用
                     hspt_output.packed_point_idx = packed_point_idx

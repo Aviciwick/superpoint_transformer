@@ -142,8 +142,23 @@ def _prepare_save_data(nag):
     if has_hspt_hard:
         is_hard = data.is_hspt_hard.cpu().numpy().astype(np.int32)
 
+    has_gt = False
+    gt_label = np.full(pos.shape[0], -1, dtype=np.int32)
+    if hasattr(data, 'y') and data.y is not None:
+        gt_tensor = data.y.cpu().numpy()
+        if gt_tensor.ndim > 1:
+            gt_label = np.argmax(gt_tensor, axis=1)
+        else:
+            gt_label = gt_tensor
+        has_gt = True
+
+    is_error = np.zeros(pos.shape[0], dtype=np.int32)
+    if has_gt:
+        is_error = (pred != gt_label).astype(np.int32)
+
     return {
         'pos': pos, 'rgb': rgb, 'pred': pred, 'obj_pred': obj_pred,
+        'gt_label': gt_label, 'has_gt': has_gt, 'is_error': is_error,
         'sp_indices': sp_indices, 'has_hspt_hard': has_hspt_hard, 'is_hard': is_hard,
         'num_points': pos.shape[0]
     }
@@ -168,21 +183,30 @@ def save_predictions(path: str, save_data: dict, dataset_name: str = None):
     sp_indices = save_data['sp_indices']
     has_hspt_hard = save_data['has_hspt_hard']
     is_hard = save_data['is_hard']
+    has_gt = save_data['has_gt']
+    gt_label = save_data['gt_label']
+    is_error = save_data['is_error']
     num_points = save_data['num_points']
 
     ext = os.path.splitext(path)[1].lower()
 
     if ext == '.ply':
         _save_binary_ply(path, pos, rgb, pred, obj_pred, sp_indices,
-                         has_hspt_hard, is_hard, num_points)
+                         has_hspt_hard, is_hard, has_gt, gt_label, is_error, num_points)
     else:
         # txt 格式退化为快速的 numpy 二进制保存
         sp_columns = [sp.reshape(-1, 1) for sp in sp_indices]
-        cols = [pos, rgb, pred.reshape(-1, 1), obj_pred.reshape(-1, 1)] + sp_columns
+        cols = [pos, rgb, pred.reshape(-1, 1), obj_pred.reshape(-1, 1)]
+        if has_gt:
+            cols.extend([gt_label.reshape(-1, 1), is_error.reshape(-1, 1)])
+        cols.extend(sp_columns)
         if has_hspt_hard:
             cols.append(is_hard.reshape(-1, 1))
         output_data = np.column_stack(cols)
+        
         fmt_list = ['%.6f'] * 3 + ['%d'] * 3 + ['%d'] * 2
+        if has_gt:
+            fmt_list.extend(['%d'] * 2)
         fmt_list.extend(['%d'] * len(sp_indices))
         if has_hspt_hard:
             fmt_list.append('%d')
@@ -192,7 +216,7 @@ def save_predictions(path: str, save_data: dict, dataset_name: str = None):
 
 
 def _save_binary_ply(path, pos, rgb, pred, obj_pred, sp_indices,
-                     has_hspt_hard, is_hard, num_points):
+                     has_hspt_hard, is_hard, has_gt, gt_label, is_error, num_points):
     """
     以二进制 little-endian 格式保存 PLY 文件。
     相比 ASCII 格式，写入速度提升 10-100 倍，文件体积缩小约 75%。
@@ -206,6 +230,9 @@ def _save_binary_ply(path, pos, rgb, pred, obj_pred, sp_indices,
         sp_indices: 超点索引列表
         has_hspt_hard: 是否有 HSPT 困难标记
         is_hard: HSPT 困难标记 (N,) int 或 None
+        has_gt: 是否有地面真值标签
+        gt_label: 地面真值标签 (N,) int
+        is_error: 预测是否错误的标记 (N,) int
         num_points: 点数
     """
     # 构建 PLY header
@@ -226,6 +253,9 @@ def _save_binary_ply(path, pos, rgb, pred, obj_pred, sp_indices,
         header_lines.append(f"property int sp_level_{i+1}")
     if has_hspt_hard:
         header_lines.append("property int is_hspt_hard")
+    if has_gt:
+        header_lines.append("property int gt_label")
+        header_lines.append("property int is_error")
     header_lines.append("end_header")
     header = "\n".join(header_lines) + "\n"
 
@@ -240,6 +270,9 @@ def _save_binary_ply(path, pos, rgb, pred, obj_pred, sp_indices,
         dt_fields.append((f'sp_level_{i+1}', '<i4'))
     if has_hspt_hard:
         dt_fields.append(('is_hspt_hard', '<i4'))
+    if has_gt:
+        dt_fields.append(('gt_label', '<i4'))
+        dt_fields.append(('is_error', '<i4'))
 
     vertex_dtype = np.dtype(dt_fields)
     vertices = np.empty(num_points, dtype=vertex_dtype)
@@ -258,6 +291,9 @@ def _save_binary_ply(path, pos, rgb, pred, obj_pred, sp_indices,
         vertices[f'sp_level_{i+1}'] = sp.astype(np.int32)
     if has_hspt_hard and is_hard is not None:
         vertices['is_hspt_hard'] = is_hard.astype(np.int32)
+    if has_gt:
+        vertices['gt_label'] = gt_label.astype(np.int32)
+        vertices['is_error'] = is_error.astype(np.int32)
 
     with open(path, 'wb') as f:
         f.write(header.encode('ascii'))
@@ -278,6 +314,25 @@ def generate_visualization(nag, output_html: str, class_names, class_colors,
         num_classes: 类别数量
     """
     nag = nag.to('cpu')
+    
+    # 调试信息：检查关键属性是否存在
+    print(f"\n[可视化调试] Level-0 属性检查:")
+    print(f"  - 所有键: {list(nag[0].keys)}")
+    print(f"  - 是否有 'y': {'y' in nag[0].keys}")
+    print(f"  - 是否有 'semantic_pred': {'semantic_pred' in nag[0].keys}")
+    
+    if 'y' in nag[0].keys:
+        y = nag[0].y
+        print(f"  - 'y' 形状: {y.shape}, dtype: {y.dtype}")
+        if y.dim() == 2:
+            print(f"  - 'y' 是直方图格式 (dim=2)")
+        else:
+            print(f"  - 'y' 是标量格式 (dim=1)")
+            print(f"  - 'y' 取值范围: [{y.min()}, {y.max()}]")
+    
+    if 'semantic_pred' in nag[0].keys:
+        pred = nag[0].semantic_pred
+        print(f"  - 'semantic_pred' 形状: {pred.shape}, dtype: {pred.dtype}")
     
     vis_output = visualize_3d(
         nag,
@@ -397,10 +452,28 @@ def main():
         
         # Auto-detect HSPT d_raw from checkpoint
         d_raw = 6
+        has_gate_head = False
+        max_rrh_linear = 0
+        rrh_hidden_dim = None
+
         for k, v in checkpoint['state_dict'].items():
             if 'hspt.cafm.point_encoder.0.weight' in k:
                 d_raw = v.shape[1]
-                break
+            elif 'hspt.rrh.refinement_head.' in k and '.weight' in k:
+                layer_idx = int(k.split('.')[3])
+                max_rrh_linear = max(max_rrh_linear, layer_idx)
+                if layer_idx == 0:
+                    rrh_hidden_dim = v.shape[0]
+            elif 'hspt.rrh.gate_head.' in k:
+                has_gate_head = True
+
+        rrh_num_layers = (max_rrh_linear // 4) + 1
+
+        if rrh_hidden_dim is not None:
+            print(f"Auto-detected RRH: hidden_dim={rrh_hidden_dim}, num_layers={rrh_num_layers}, gated={has_gate_head}")
+            overrides.append(f"model.hspt.rrh_hidden_dim={rrh_hidden_dim}")
+            overrides.append(f"model.hspt.rrh_num_layers={rrh_num_layers}")
+            overrides.append(f"model.hspt.rrh_use_gated_fusion={str(has_gate_head)}")
                 
         if d_raw == 3:
             print("Auto-detected HSPT raw_keys=['pos'] from checkpoint")
@@ -430,7 +503,7 @@ def main():
     if on_device_transform is None:
         on_device_transform = getattr(datamodule, 'on_device_val_transform', None)
     
-    model.load_state_dict(checkpoint['state_dict'])
+    model.load_state_dict(checkpoint['state_dict'], strict=False)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")

@@ -62,6 +62,13 @@ class TestResidualRefinementHead:
         
         assert point_logits.shape == (K, N, C), \
             f"point_logits 形状错误: 期望 ({K}, {N}, {C}), 实际 {point_logits.shape}"
+
+    def test_default_capacity_scaling(self):
+        """验证默认 RRH 容量扩展：hidden_dim 至少是 4*d_model。"""
+        head = ResidualRefinementHead(d_model=64, num_classes=13)
+        first_linear = next(layer for layer in head.refinement_head if isinstance(layer, torch.nn.Linear))
+        assert first_linear.out_features >= 256, \
+            f"默认 hidden_dim 过小: {first_linear.out_features}"
     
     # ==========================================
     # 2. 残差加和测试
@@ -97,6 +104,26 @@ class TestResidualRefinementHead:
         # 不传入 coarse_logits
         point_logits = head(enhanced, points)
         
+        assert point_logits.shape == (enhanced.shape[0], points.shape[1], head.num_classes)
+
+    def test_gate_value_range(self, sample_data):
+        """验证门控输出范围在 [0, 1]。"""
+        enhanced, points, _ = sample_data
+        head = ResidualRefinementHead(d_model=64, num_classes=13, use_gated_fusion=True)
+
+        with torch.no_grad():
+            sp_expanded = enhanced.unsqueeze(1).expand(-1, points.shape[1], -1)
+            combined = torch.cat([sp_expanded, points], dim=-1)
+            gate = torch.sigmoid(head.gate_head(combined))
+
+        assert gate.min().item() >= 0.0
+        assert gate.max().item() <= 1.0
+
+    def test_disable_gated_fusion(self, sample_data):
+        """验证可关闭门控融合并保持前向可用。"""
+        enhanced, points, coarse = sample_data
+        head = ResidualRefinementHead(d_model=64, num_classes=13, use_gated_fusion=False)
+        point_logits = head(enhanced, points, coarse)
         assert point_logits.shape == (enhanced.shape[0], points.shape[1], head.num_classes)
     
     # ==========================================
