@@ -1,0 +1,21 @@
+# @package _global_
+
+# Generic single-region point-refinement control for KITTI-360.
+
+defaults:
+  - /experiment/semantic/kitti360_bsr
+
+model:
+  bsr:
+    refiner:
+      variant: single_residual_gated
+      n_subregions: 1
+    loss:
+      lambda_diversity: 0.0
+    propagation:
+      mode: slot_all_points
+      metric_level: point
+
+logger:
+  wandb:
+    name: "SPT-64-BSR-KITTI360-point-refinement-control"

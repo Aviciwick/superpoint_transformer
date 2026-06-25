@@ -1,0 +1,41 @@
+# @package _global_
+
+defaults:
+  - override /datamodule: semantic/toronto3d.yaml
+  - override /model: semantic/spt-2.yaml
+  - override /trainer: gpu.yaml
+
+trainer:
+  max_epochs: 1000
+  precision: 32
+
+datamodule:
+  # 自定义训练和测试划分
+  train_clouds:
+    - "L001"
+    - "L003"
+    - "L004"
+    - "L002"
+  test_clouds:
+    - "L002"
+  
+  # 因为数据划分发生了改变，必须修改 custom_hash 以重新生成预处理缓存
+  custom_hash: "toronto3d_full_v1"
+
+  # 【临时避坑方案】
+  # 之前诊断出 intensity 特征 (1D) 会在 NAGDropoutColumns 中触发 IndexError。
+  # 为了使用 intensity 且不修改代码，我们在此临时关闭 node_feat_drop。
+  node_feat_drop: 0
+
+model:
+  optimizer:
+    lr: 0.01
+    weight_decay: 1e-4
+
+logger:
+  wandb:
+    project: "spt_toronto3d"
+    name: "SPT-64-Toronto3D-intensity-full"
+    group: "toronto3d/spt"
+    tags: ["semantic", "toronto3d", "spt", "spt64", "baseline", "intensity", "full_train"]
+    job_type: "semantic_baseline"

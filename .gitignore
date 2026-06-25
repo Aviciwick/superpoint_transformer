@@ -179,7 +179,21 @@ output/*
 
 #论文相关
 期刊论文撰写/*
-IEEE-Transactions-LaTeX2e-templates-and-instructions/*
 
 #ide
 .trae/*
+.opencode/*
+
+# keep root editor automation files trackable
+!.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+
+AGENTS.md
+审稿意见.md
+项目总结.md
+latex.md
+
+
+tmp/*

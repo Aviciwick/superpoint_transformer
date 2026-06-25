@@ -1,0 +1,17 @@
+# @package _global_
+
+# Sampled-point-only control: only sampled candidate points use local logits.
+# Unsampled candidate points and non-candidate points inherit coarse SPT logits.
+
+defaults:
+  - /experiment/semantic/dales_bsr
+
+model:
+  bsr:
+    propagation:
+      mode: sampled_point_only
+      metric_level: point
+
+logger:
+  wandb:
+    name: "SPT-64-BSR-sampled-point-only"

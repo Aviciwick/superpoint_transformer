@@ -1,12 +1,13 @@
 import torch
 import os
 import os.path as osp
-from torch.nn import ModuleList
+from torch.nn import ModuleDict, ModuleList
+from torch.nn.parameter import UninitializedParameter
 import logging
 from copy import deepcopy
-from typing import List, Tuple, Dict, Union, Any
+from typing import Iterable, List, Tuple, Dict, Union, Any
 from pytorch_lightning import LightningModule
-from torchmetrics import MaxMetric, MeanMetric, SumMetric, CatMetric
+from torchmetrics import MaxMetric, SumMetric, CatMetric
 from pytorch_lightning.loggers.wandb import WandbLogger
 
 from src.metrics import ConfusionMatrix
@@ -20,23 +21,267 @@ from src.utils import (
     SemanticSegmentationOutput,
     PartitionOutput,
     get_commit_hash)
+from src.utils.torchmetrics import SafeMeanMetric
 from src.nn import Classifier
 from src.loss import MultiLoss
 from src.optim.lr_scheduler import ON_PLATEAU_SCHEDULERS
 from src.data import NAG, Data
 from src.transforms import Transform, NAGSaveNodeIndex, PretrainedCNN
 
-# H-SPT 模块导入
+MeanMetric = SafeMeanMetric
+
+
+# BSR-SPT 模块导入
 try:
-    from src.hspt import HSPTModule, build_packed_points, compute_refine_loss
-    HSPT_AVAILABLE = True
+    from src.bsr import (
+        BSRModule,
+        build_candidate_point_cloud as build_bsr_candidate_point_cloud,
+        build_packed_points as build_bsr_packed_points,
+        compute_bsr_losses,
+    )
+    from src.bsr.geometry import extract_selector_handcrafted_features
+    BSR_AVAILABLE = True
 except ImportError:
-    HSPT_AVAILABLE = False
+    BSR_AVAILABLE = False
 
 log = logging.getLogger(__name__)
 
 
-__all__ = ['SemanticSegmentationModule']
+__all__ = [
+    'SemanticSegmentationModule',
+    'build_semantic_wandb_metadata',
+    'safe_count_parameters',
+]
+
+
+def _cfg_get(obj, key, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    getter = getattr(obj, 'get', None)
+    if getter is not None:
+        try:
+            return getter(key, default)
+        except Exception:
+            pass
+    return getattr(obj, key, default)
+
+
+def _cfg_get_nested(obj, keys, default=None):
+    current = obj
+    for key in keys:
+        current = _cfg_get(current, key, default=None)
+        if current is None:
+            return default
+    return current
+
+
+def _safe_len(obj):
+    if obj is None:
+        return None
+    try:
+        return len(obj)
+    except Exception:
+        return None
+
+
+def _callable_name(obj):
+    if obj is None:
+        return None
+    func = getattr(obj, 'func', None)
+    if func is not None:
+        return getattr(func, '__name__', func.__class__.__name__)
+    target = _cfg_get(obj, '_target_', None)
+    if target is not None:
+        return str(target).split('.')[-1]
+    return obj.__class__.__name__
+
+
+def _wandb_safe_value(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if torch.is_tensor(value):
+        value = value.detach().cpu()
+        if value.numel() == 1:
+            return value.item()
+        return value.tolist()
+    if isinstance(value, tuple):
+        return [_wandb_safe_value(v) for v in value]
+    if isinstance(value, list):
+        return [_wandb_safe_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _wandb_safe_value(v) for k, v in value.items()}
+    items = getattr(value, 'items', None)
+    if items is not None:
+        try:
+            return {str(k): _wandb_safe_value(v) for k, v in items()}
+        except Exception:
+            pass
+    return str(value)
+
+
+def safe_count_parameters(
+        parameters: Iterable[torch.nn.Parameter]) -> Tuple[int, int]:
+    """Count initialized parameters without materializing LazyModule weights."""
+    total = 0
+    trainable = 0
+    for parameter in parameters:
+        if isinstance(parameter, UninitializedParameter):
+            continue
+        count = parameter.numel()
+        total += count
+        if parameter.requires_grad:
+            trainable += count
+    return int(total), int(trainable)
+
+
+def _scalar_float(value, default=None):
+    if value is None:
+        return default
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return default
+        value = value.detach().cpu().reshape(-1)[0].item()
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def build_semantic_wandb_metadata(
+        trainer,
+        datamodule,
+        model_hparams,
+        num_classes: int,
+        class_names: List[str],
+        stuff_classes=None,
+        bsr_enabled: bool = False,
+        parameter_counts: Tuple[int, int] = None,
+        commit_hash: str = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Build dataset-agnostic run metadata for W&B config and summary."""
+    train_dataset = getattr(datamodule, 'train_dataset', None)
+    val_dataset = getattr(datamodule, 'val_dataset', None)
+    test_dataset = getattr(datamodule, 'test_dataset', None)
+    dataset_ref = train_dataset or val_dataset or test_dataset
+    datamodule_hparams = getattr(datamodule, 'hparams', None)
+    dataloader_hparams = _cfg_get(datamodule_hparams, 'dataloader', None)
+    optimizer = _cfg_get(model_hparams, 'optimizer', None)
+    scheduler = _cfg_get(model_hparams, 'scheduler', None)
+    bsr_cfg = _cfg_get(model_hparams, 'bsr', {}) or {}
+    bsr_selector_cfg = _cfg_get(bsr_cfg, 'selector', {}) or {}
+    bsr_refiner_cfg = _cfg_get(bsr_cfg, 'refiner', {}) or {}
+    bsr_propagation_cfg = _cfg_get(bsr_cfg, 'propagation', {}) or {}
+    total_params, trainable_params = parameter_counts or (None, None)
+
+    if stuff_classes is None and dataset_ref is not None:
+        stuff_classes = getattr(dataset_ref, 'stuff_classes', None)
+
+    config = {
+        'run/dataset_class': dataset_ref.__class__.__name__ if dataset_ref is not None else None,
+        'run/num_classes': int(num_classes) if num_classes is not None else None,
+        'run/class_names': list(class_names or []),
+        'run/stuff_classes': list(stuff_classes or []),
+        'run/train_items': _safe_len(train_dataset),
+        'run/val_items': _safe_len(val_dataset),
+        'run/test_items': _safe_len(test_dataset),
+        'run/max_epochs': getattr(trainer, 'max_epochs', None),
+        'run/check_val_every_n_epoch': getattr(trainer, 'check_val_every_n_epoch', None),
+        'run/precision': getattr(trainer, 'precision', None),
+        'run/batch_size': _cfg_get(dataloader_hparams, 'batch_size', None),
+        'run/num_workers': _cfg_get(dataloader_hparams, 'num_workers', None),
+        'run/xy_tiling': _cfg_get(datamodule_hparams, 'xy_tiling', None),
+        'run/pc_tiling': _cfg_get(datamodule_hparams, 'pc_tiling', None),
+        'run/voxel': _cfg_get(datamodule_hparams, 'voxel', None),
+        'run/optimizer': _callable_name(optimizer),
+        'run/lr': _cfg_get_nested(optimizer, ['keywords', 'lr'], None),
+        'run/weight_decay': _cfg_get_nested(optimizer, ['keywords', 'weight_decay'], None),
+        'run/scheduler': _callable_name(scheduler),
+        'run/scheduler_warmup': _cfg_get_nested(scheduler, ['keywords', 'num_warmup'], None),
+        'run/bsr_enabled': bool(bsr_enabled),
+        'run/bsr_variant': _cfg_get(bsr_refiner_cfg, 'variant', None),
+        'run/bsr_propagation_mode': _cfg_get(
+            bsr_propagation_cfg, 'mode', 'slot_all_points' if bsr_enabled else None),
+        'run/bsr_metric_level': _cfg_get(
+            bsr_propagation_cfg, 'metric_level', 'point' if bsr_enabled else None),
+        'run/bsr_topk_ratio': _cfg_get(bsr_selector_cfg, 'topk_ratio', None),
+        'run/bsr_n_sample': _cfg_get(bsr_refiner_cfg, 'n_sample', None),
+        'run/bsr_n_subregions': _cfg_get(bsr_refiner_cfg, 'n_subregions', None),
+        'run/num_parameters': total_params,
+        'run/num_trainable_parameters': trainable_params,
+        'run/commit_hash': commit_hash,
+    }
+    config = {k: _wandb_safe_value(v) for k, v in config.items()}
+
+    summary_keys = [
+        'run/train_items',
+        'run/val_items',
+        'run/test_items',
+        'run/max_epochs',
+        'run/check_val_every_n_epoch',
+        'run/num_parameters',
+        'run/num_trainable_parameters',
+    ]
+    summary = {k: config[k] for k in summary_keys if config.get(k) is not None}
+    summary['run/bsr_enabled'] = int(bool(bsr_enabled))
+    return config, summary
+
+
+def _point_attr_dim(value) -> int:
+    if value is None or not torch.is_tensor(value):
+        return 0
+    if value.dim() <= 1:
+        return 1
+    return int(value.shape[-1])
+
+
+def _resolve_available_bsr_raw_keys(
+        data_0: Data,
+        preferred_keys: List[str],
+        expected_d_raw: int = None) -> List[str]:
+    available = {}
+    for key in preferred_keys:
+        value = getattr(data_0, key, None)
+        dim = _point_attr_dim(value)
+        if dim > 0:
+            available[key] = dim
+
+    if 'pos' not in available:
+        pos_value = getattr(data_0, 'pos', None)
+        pos_dim = _point_attr_dim(pos_value)
+        if pos_dim > 0:
+            available['pos'] = pos_dim
+
+    if not available:
+        return []
+
+    ordered_keys = []
+    if 'pos' in available:
+        ordered_keys.append('pos')
+    ordered_keys.extend([key for key in preferred_keys if key in available and key != 'pos'])
+    ordered_keys.extend([key for key in available.keys() if key not in ordered_keys])
+
+    if expected_d_raw is None or expected_d_raw <= 0:
+        return ordered_keys
+
+    resolved = []
+    resolved_dim = 0
+    for key in ordered_keys:
+        key_dim = available[key]
+        if resolved_dim + key_dim > expected_d_raw:
+            continue
+        resolved.append(key)
+        resolved_dim += key_dim
+        if resolved_dim == expected_d_raw:
+            break
+
+    if resolved_dim == expected_d_raw and resolved:
+        return resolved
+
+    if 'pos' in available and available['pos'] == expected_d_raw:
+        return ['pos']
+
+    return ordered_keys
 
 
 class SemanticSegmentationModule(LightningModule):
@@ -152,8 +397,9 @@ class SemanticSegmentationModule(LightningModule):
             track_val_every_n_epoch: int = 1,
             track_val_idx: int = None,
             track_test_idx: int = None,
-            hspt: dict = None,
+            bsr: dict = None,
             **kwargs):
+        legacy_hspt_cfg = kwargs.pop('hspt', None)
         super().__init__()
 
         # Allows to access init params with 'self.hparams' attribute
@@ -237,6 +483,7 @@ class SemanticSegmentationModule(LightningModule):
         self.val_miou_best = MaxMetric()
         self.val_oa_best = MaxMetric()
         self.val_macc_best = MaxMetric()
+        self._val_best_epochs = {}
 
         # For tracking number of points andsuperpoints     
         self.val_n_p = SumMetric()
@@ -259,98 +506,474 @@ class SemanticSegmentationModule(LightningModule):
         # Explicitly call the garbage collector after a certain number
         # of steps
         self.gc_every_n_steps = int(gc_every_n_steps)
-        
+        self._wandb_run_metadata_logged = False
+
+        if (bsr or {}).get('enable', False):
+            self._geo_feature_keys = [
+                'linearity', 'planarity', 'scattering', 'verticality',
+                'curvature', 'length', 'surface', 'volume'
+            ]
+            self._geo_scatter_idx = 2
+            self._geo_missing_warned = False
+
         # ===========================
-        # H-SPT 模块初始化
+        # BSR-SPT 模块初始化
         # ===========================
-        self.hspt_enabled = False
-        self.hspt = None
-        self.hspt_config = hspt or {}
-        
-        if self.hspt_config.get('enable', False):
-            if not HSPT_AVAILABLE:
-                log.warning("H-SPT 模块未找到，跳过初始化")
+        self.bsr_enabled = False
+        self.bsr = None
+        self.bsr_config = bsr or {}
+        self._bsr_raw_keys_resolved = False
+
+        if self.bsr_config.get('enable', False):
+            if not BSR_AVAILABLE:
+                log.warning("BSR 模块未找到，跳过初始化")
             elif getattr(self.net, 'nano', False):
-                log.warning("nano 模式不支持 H-SPT（需要原子点数据），跳过初始化")
+                log.warning("nano 模式不支持 BSR（需要原子点数据），跳过初始化")
             else:
-                self.hspt_enabled = True
-                self.hspt = HSPTModule(
+                selector_cfg = self.bsr_config.get('selector', {})
+                refiner_cfg = self.bsr_config.get('refiner', {})
+                loss_cfg = self.bsr_config.get('loss', {})
+                feedback_cfg = self.bsr_config.get('feedback', {})
+                partition_cfg = self.bsr_config.get('partition_adapter', {})
+                propagation_cfg = self.bsr_config.get('propagation', {})
+                refiner_variant = refiner_cfg.get('variant', None)
+                if refiner_variant is None:
+                    legacy_mode = refiner_cfg.get('point_head_mode', 'residual_gated')
+                    refiner_variant = {
+                        'residual_gated': 'single_residual_gated',
+                        'direct': 'single_direct',
+                    }.get(legacy_mode, legacy_mode)
+                requested_boundary_head = bool(refiner_cfg.get('use_boundary_head', True))
+                lambda_boundary = float(loss_cfg.get('lambda_boundary', 0.0))
+                effective_boundary_head = requested_boundary_head and lambda_boundary > 0.0
+                if requested_boundary_head and not effective_boundary_head:
+                    log.warning(
+                        "BSR boundary head is disabled because lambda_boundary <= 0. "
+                        "Set model.bsr.loss.lambda_boundary > 0 to train it."
+                    )
+
+                self.bsr_enabled = True
+                self.bsr = BSRModule(
                     d_model=self.net.out_dim if not self.multi_stage_loss else self.net.out_dim[0],
                     num_classes=num_classes,
-                    topk_ratio=self.hspt_config.get('topk_ratio', 0.2),
-                    n_sample=self.hspt_config.get('n_sample', 64),
-                    d_raw=self.hspt_config.get('d_raw', 3),
-                    n_heads=self.hspt_config.get('n_heads', 4),
-                    cafm_query_mode=self.hspt_config.get('cafm_query_mode', 'point'),
-                    cafm_point_fusion_weight=self.hspt_config.get('cafm_point_fusion_weight', 1.0),
-                    use_residual=self.hspt_config.get('use_residual', True),
-                    rrh_hidden_dim=self.hspt_config.get('rrh_hidden_dim', None),
-                    rrh_mlp_ratio=self.hspt_config.get('rrh_mlp_ratio', 4.0),
-                    rrh_num_layers=self.hspt_config.get('rrh_num_layers', 3),
-                    rrh_use_gated_fusion=self.hspt_config.get('rrh_use_gated_fusion', True),
-                    dropout=self.hspt_config.get('dropout', 0.1),
-                    alpha=self.hspt_config.get('alpha', 0.7),
-                    beta=self.hspt_config.get('beta', 0.3)
+                    selector_topk_ratio=selector_cfg.get('topk_ratio', 0.2),
+                    selector_score_terms=selector_cfg.get(
+                        'score_terms', ['uncertainty', 'geometry', 'boundary']),
+                    selector_term_weights=selector_cfg.get(
+                        'term_weights',
+                        {'uncertainty': 0.5, 'geometry': 0.25, 'boundary': 0.25}),
+                    selector_scatter_idx=selector_cfg.get('scatter_idx', 2),
+                    n_sample=refiner_cfg.get('n_sample', 64),
+                    d_raw=refiner_cfg.get('d_raw', 6),
+                    n_heads=refiner_cfg.get('n_heads', 4),
+                    token_mode=refiner_cfg.get('token_mode', 'superpoint_query'),
+                    dropout=refiner_cfg.get('dropout', 0.1),
+                    hidden_dim=refiner_cfg.get('hidden_dim', None),
+                    variant=refiner_variant,
+                    n_subregions=refiner_cfg.get('n_subregions', 2),
+                    assignment_temperature=refiner_cfg.get('assignment_temperature', 1.0),
+                    point_head_mode=refiner_cfg.get('point_head_mode', None),
+                    use_boundary_head=effective_boundary_head,
+                    partition_adapter_enable=partition_cfg.get('enable', False),
+                    partition_adapter_min_points=partition_cfg.get('min_points_per_sp', 3),
+                    partition_adapter_merge_small=partition_cfg.get('merge_small_clusters', True),
                 )
-                self.hspt_lambda_refine = self.hspt_config.get('lambda_refine', 0.5)
-                self.hspt_logit_fusion_alpha = self.hspt_config.get('logit_fusion_alpha', 0.5)
-                self.hspt_raw_keys = self.hspt_config.get('raw_keys', ['pos'])
-                log.info(f"H-SPT 模块已启用: topk_ratio={self.hspt_config.get('topk_ratio', 0.2)}, "
-                         f"n_sample={self.hspt_config.get('n_sample', 64)}, "
-                         f"lambda_refine={self.hspt_lambda_refine}, "
-                         f"logit_fusion_alpha={self.hspt_logit_fusion_alpha}")
-                
-                # 初始化 H-SPT refine loss 指标（train/val/test）
+                self.bsr_raw_keys = self.bsr_config.get('raw_keys', ['pos', 'rgb'])
+                self.bsr_sampling_mode = refiner_cfg.get('sampling_mode', 'coverage')
+                self.bsr_sampling_without_replacement = refiner_cfg.get(
+                    'sampling_without_replacement', True)
+                self.bsr_lambda_refine = loss_cfg.get('lambda_refine', 0.5)
+                self.bsr_lambda_consistency = loss_cfg.get('lambda_consistency', 0.1)
+                self.bsr_lambda_diversity = float(loss_cfg.get('lambda_diversity', 0.02))
+                self.bsr_lambda_boundary = lambda_boundary
+                self.bsr_score_weighting = loss_cfg.get('score_weighting', True)
+                self.bsr_score_weight_gamma = loss_cfg.get('score_weight_gamma', 1.0)
+                self.bsr_loss_weight = float(loss_cfg.get('global_weight', 0.5))
+                self.bsr_loss_warmup_epochs = int(loss_cfg.get('warmup_epochs', 10))
+                self.bsr_feedback_warmup_epochs = int(
+                    feedback_cfg.get('warmup_epochs', self.bsr_loss_warmup_epochs))
+                self.bsr_logit_fusion_alpha = feedback_cfg.get('logit_fusion_alpha', 0.5)
+                self.bsr_propagation_mode = propagation_cfg.get('mode', 'slot_all_points')
+                self.bsr_propagation_chunk_size = int(propagation_cfg.get('chunk_size', 200000))
+                self.bsr_store_slot_affinity = bool(propagation_cfg.get('store_slot_affinity', False))
+                self.bsr_dual_slot_threshold = float(propagation_cfg.get('dual_slot_threshold', 0.2))
+                self.bsr_metric_level = propagation_cfg.get('metric_level', 'point')
+                self.bsr_selector_metric_terms = tuple(selector_cfg.get(
+                    'score_terms', ['uncertainty', 'geometry', 'boundary']))
+
                 self.train_refine_loss = MeanMetric()
                 self.val_refine_loss = MeanMetric()
                 self.test_refine_loss = MeanMetric()
-                
-                # 异常熔断计数器
-                self._hspt_fail_count = 0
-                self._hspt_total_count = 0
-                self._hspt_consecutive_fail = 0
-                self._hspt_fuse_threshold = 10  # 连续失败 N 次后熔断
+                self.train_consistency_loss = MeanMetric()
+                self.val_consistency_loss = MeanMetric()
+                self.test_consistency_loss = MeanMetric()
+                self.train_diversity_loss = MeanMetric()
+                self.val_diversity_loss = MeanMetric()
+                self.test_diversity_loss = MeanMetric()
+                self.train_boundary_loss = MeanMetric()
+                self.val_boundary_loss = MeanMetric()
+                self.test_boundary_loss = MeanMetric()
+                self.train_candidate_ratio = MeanMetric()
+                self.val_candidate_ratio = MeanMetric()
+                self.test_candidate_ratio = MeanMetric()
+                self.train_candidate_score = MeanMetric()
+                self.val_candidate_score = MeanMetric()
+                self.test_candidate_score = MeanMetric()
+                self.train_sample_valid_ratio = MeanMetric()
+                self.val_sample_valid_ratio = MeanMetric()
+                self.test_sample_valid_ratio = MeanMetric()
+                self.train_num_valid_sampled_points = MeanMetric()
+                self.val_num_valid_sampled_points = MeanMetric()
+                self.test_num_valid_sampled_points = MeanMetric()
+                self.train_avg_valid_points_per_candidate = MeanMetric()
+                self.val_avg_valid_points_per_candidate = MeanMetric()
+                self.test_avg_valid_points_per_candidate = MeanMetric()
+                self.train_effective_refine_ratio = MeanMetric()
+                self.val_effective_refine_ratio = MeanMetric()
+                self.test_effective_refine_ratio = MeanMetric()
+                self.train_point_gate_mean = MeanMetric()
+                self.val_point_gate_mean = MeanMetric()
+                self.test_point_gate_mean = MeanMetric()
+                self.train_assignment_entropy = MeanMetric()
+                self.val_assignment_entropy = MeanMetric()
+                self.test_assignment_entropy = MeanMetric()
+                self.train_secondary_slot_mass = MeanMetric()
+                self.val_secondary_slot_mass = MeanMetric()
+                self.test_secondary_slot_mass = MeanMetric()
+                self.train_dual_slot_activation_ratio = MeanMetric()
+                self.val_dual_slot_activation_ratio = MeanMetric()
+                self.test_dual_slot_activation_ratio = MeanMetric()
+                self.train_slot_diversity = MeanMetric()
+                self.val_slot_diversity = MeanMetric()
+                self.test_slot_diversity = MeanMetric()
+                self.train_point_propagation_coverage = MeanMetric()
+                self.val_point_propagation_coverage = MeanMetric()
+                self.test_point_propagation_coverage = MeanMetric()
+                self.train_bsr_selector_terms = ModuleDict({
+                    term: MeanMetric() for term in self.bsr_selector_metric_terms})
+                self.val_bsr_selector_terms = ModuleDict({
+                    term: MeanMetric() for term in self.bsr_selector_metric_terms})
+                self.test_bsr_selector_terms = ModuleDict({
+                    term: MeanMetric() for term in self.bsr_selector_metric_terms})
+                self.train_bsr_selector_term_vars = ModuleDict({
+                    term: MeanMetric() for term in self.bsr_selector_metric_terms})
+                self.val_bsr_selector_term_vars = ModuleDict({
+                    term: MeanMetric() for term in self.bsr_selector_metric_terms})
+                self.test_bsr_selector_term_vars = ModuleDict({
+                    term: MeanMetric() for term in self.bsr_selector_metric_terms})
 
-                # AUS 几何特征通道定义契约
-                # 固定顺序：[linearity, planarity, scattering, verticality, ...]
-                self._geo_feature_keys = [
-                    'linearity', 'planarity', 'scattering', 'verticality',
-                    'curvature', 'length', 'surface', 'volume'
-                ]
-                self._geo_scatter_idx = 2  # scattering 在上述列表中的索引
-                self._geo_missing_warned = False
+                self._bsr_fail_count = 0
+                self._bsr_total_count = 0
+                self._bsr_consecutive_fail = 0
+                self._bsr_fuse_threshold = 10
+                self._bsr_stage_fail_count = {'train': 0, 'val': 0, 'test': 0}
+                self._bsr_stage_total_count = {'train': 0, 'val': 0, 'test': 0}
 
-    def _fuse_hspt_superpoint_logits(
+                log.info(
+                    "BSR-SPT enabled: topk_ratio=%s, n_sample=%s, sampling_mode=%s, refiner_variant=%s, "
+                    "lambda_refine=%s, lambda_consistency=%s, lambda_diversity=%s, lambda_boundary=%s, "
+                    "score_weighting=%s, global_weight=%s, warmup_epochs=%s, fusion_warmup_epochs=%s",
+                    selector_cfg.get('topk_ratio', 0.2),
+                    refiner_cfg.get('n_sample', 64),
+                    self.bsr_sampling_mode,
+                    refiner_variant,
+                    self.bsr_lambda_refine,
+                    self.bsr_lambda_consistency,
+                    self.bsr_lambda_diversity,
+                    self.bsr_lambda_boundary,
+                    self.bsr_score_weighting,
+                    self.bsr_loss_weight,
+                    self.bsr_loss_warmup_epochs,
+                    self.bsr_feedback_warmup_epochs,
+                )
+
+        if legacy_hspt_cfg is not None:
+            requested = bool((legacy_hspt_cfg or {}).get('enable', False))
+            log.warning(
+                "Legacy model.hspt configuration was provided%s, but the current "
+                "semantic training/inference path ignores H-SPT and only supports "
+                "SPT baseline or BSR-SPT.",
+                " with enable=True" if requested else "",
+            )
+
+    def _current_bsr_stage(self) -> str:
+        try:
+            if self.trainer is None:
+                return 'train' if self.training else 'val'
+            if self.trainer.training:
+                return 'train'
+            if self.trainer.validating:
+                return 'val'
+            if self.trainer.testing:
+                return 'test'
+        except Exception:
+            pass
+        return 'train' if self.training else 'val'
+
+    def _bsr_warmup_factor(self, warmup_epochs: int) -> float:
+        if warmup_epochs <= 0:
+            return 1.0
+        epoch = max(int(getattr(self, 'current_epoch', 0)), 0)
+        return min(1.0, float(epoch) / float(warmup_epochs))
+
+    def _current_bsr_loss_weight(self) -> float:
+        base_weight = float(getattr(self, 'bsr_loss_weight', 1.0))
+        return base_weight * self._bsr_warmup_factor(
+            int(getattr(self, 'bsr_loss_warmup_epochs', 0)))
+
+    def _current_bsr_fusion_alpha(self) -> float:
+        base_alpha = float(getattr(self, 'bsr_logit_fusion_alpha', 0.0))
+        return base_alpha * self._bsr_warmup_factor(
+            int(getattr(self, 'bsr_feedback_warmup_epochs', 0)))
+
+    def _current_bsr_point_gate_mean(self, bsr_output, device: torch.device) -> torch.Tensor:
+        gates = getattr(bsr_output, 'point_residual_gates', None)
+        if gates is None or gates.numel() == 0:
+            return torch.tensor(0.0, device=device)
+
+        gates = gates.to(device=device, dtype=torch.float32)
+        sampled_mask = getattr(bsr_output, 'sampled_point_mask', None)
+        if sampled_mask is None or sampled_mask.numel() == 0:
+            return gates.mean()
+
+        valid = sampled_mask.to(device=device, dtype=torch.float32)
+        denom = valid.sum().clamp(min=1.0)
+        return (gates * valid).sum() / denom
+
+    def _current_bsr_output_mean(
+            self,
+            bsr_output,
+            attr: str,
+            device: torch.device) -> torch.Tensor:
+        values = getattr(bsr_output, attr, None)
+        if values is None:
+            return torch.tensor(0.0, device=device)
+        if isinstance(values, (float, int)):
+            return torch.tensor(float(values), device=device)
+        if not torch.is_tensor(values) or values.numel() == 0:
+            return torch.tensor(0.0, device=device)
+        return values.detach().to(device=device, dtype=torch.float32).mean()
+
+    def _fuse_bsr_superpoint_logits(
             self,
             coarse_logits: torch.Tensor,
-            hspt_output) -> torch.Tensor:
-        """融合 H-SPT 点级预测到 superpoint logits。
-
-        仅对困难超点区域进行融合，避免影响整图稳定性。
-        """
-        alpha = float(getattr(self, 'hspt_logit_fusion_alpha', 0.0))
-        if alpha <= 0.0 or hspt_output is None:
+            bsr_output) -> torch.Tensor:
+        """Fuse refined candidate logits back into superpoint logits."""
+        alpha = self._current_bsr_fusion_alpha()
+        if alpha <= 0.0 or bsr_output is None:
             return coarse_logits
 
-        point_logits = getattr(hspt_output, 'point_logits', None)
-        hard_sp_indices = getattr(hspt_output, 'hard_sp_indices', None)
-        if point_logits is None or hard_sp_indices is None or point_logits.numel() == 0:
-            return coarse_logits
-
-        if point_logits.dim() != 3:
-            return coarse_logits
-
-        # [K, N, C] -> [K, C]
-        refined_sp_logits = point_logits.mean(dim=1)
-        if refined_sp_logits.shape[0] != hard_sp_indices.numel():
+        refined_logits = getattr(bsr_output, 'refined_sp_logits', None)
+        candidate_indices = getattr(bsr_output, 'candidate_indices', None)
+        if refined_logits is None or candidate_indices is None or candidate_indices.numel() == 0:
             return coarse_logits
 
         fused_logits = coarse_logits.clone()
-        fused_logits[hard_sp_indices] = (
-            (1.0 - alpha) * fused_logits[hard_sp_indices]
-            + alpha * refined_sp_logits
+        fused_logits[candidate_indices] = (
+            (1.0 - alpha) * fused_logits[candidate_indices]
+            + alpha * refined_logits[candidate_indices].to(fused_logits.dtype)
         )
         return fused_logits
+
+    def _scatter_superpoint_logits_to_points(
+            self,
+            logits: torch.Tensor,
+            nag: NAG) -> torch.Tensor:
+        super_index = getattr(nag[0], 'super_index', None)
+        if super_index is None:
+            raise ValueError("NAG level-0 data must provide super_index for point-level metrics")
+        return logits[super_index.to(device=logits.device, dtype=torch.long)]
+
+    def _build_bsr_point_logits(
+            self,
+            nag: NAG,
+            superpoint_logits: torch.Tensor,
+            bsr_output) -> None:
+        """Construct paper-aligned level-0 logits for BSR output.
+
+        Candidate points receive slot-propagated logits; non-candidate
+        points inherit their parent superpoint logits.
+        """
+        super_index = getattr(nag[0], 'super_index', None)
+        if super_index is None:
+            return
+
+        super_index = super_index.to(device=superpoint_logits.device, dtype=torch.long)
+        point_logits = superpoint_logits[super_index].detach().clone()
+        propagation_mask = torch.zeros(
+            super_index.numel(),
+            dtype=torch.bool,
+            device=superpoint_logits.device,
+        )
+        bsr_output.point_logits = point_logits
+        bsr_output.point_propagation_mask = propagation_mask
+        bsr_output.point_propagation_coverage = 0.0
+
+        candidate_indices = getattr(bsr_output, 'candidate_indices', None)
+        if candidate_indices is None or candidate_indices.numel() == 0:
+            return
+
+        mode = str(getattr(self, 'bsr_propagation_mode', 'slot_all_points'))
+        alpha = float(getattr(bsr_output, 'warmup_fusion_alpha', self._current_bsr_fusion_alpha()))
+        coarse_candidate_logits = getattr(bsr_output, 'coarse_candidate_logits', None)
+        if coarse_candidate_logits is None:
+            coarse_candidate_logits = superpoint_logits[candidate_indices]
+
+        if mode in {'none', 'legacy_superpoint'}:
+            bsr_output.point_propagation_coverage = 0.0
+            return
+
+        if mode == 'sampled_point_only':
+            sampled_idx = getattr(bsr_output, 'sampled_point_indices', None)
+            sampled_mask = getattr(bsr_output, 'sampled_point_mask', None)
+            sampled_logits = getattr(bsr_output, 'sampled_point_logits', None)
+            if sampled_idx is None or sampled_logits is None or sampled_idx.numel() == 0:
+                return
+            valid = sampled_idx >= 0
+            if sampled_mask is not None:
+                valid = valid & sampled_mask.to(device=valid.device, dtype=torch.bool)
+            if not valid.any():
+                return
+
+            row_ids = torch.arange(sampled_idx.shape[0], device=sampled_idx.device).unsqueeze(1)
+            row_ids = row_ids.expand_as(sampled_idx)[valid]
+            point_ids = sampled_idx[valid].to(device=point_logits.device, dtype=torch.long)
+            valid_point_ids = (point_ids >= 0) & (point_ids < point_logits.shape[0])
+            if not valid_point_ids.any():
+                return
+            row_ids = row_ids[valid_point_ids].to(device=point_logits.device, dtype=torch.long)
+            point_ids = point_ids[valid_point_ids]
+            local_logits = sampled_logits[valid][valid_point_ids].to(device=point_logits.device, dtype=point_logits.dtype)
+            coarse_base = coarse_candidate_logits[row_ids].to(device=point_logits.device, dtype=point_logits.dtype)
+            point_logits[point_ids] = (1.0 - alpha) * coarse_base + alpha * local_logits
+            propagation_mask[point_ids] = True
+            bsr_output.point_logits = point_logits
+            bsr_output.point_propagation_mask = propagation_mask
+            bsr_output.point_propagation_coverage = float(
+                propagation_mask.float().mean().detach().item()
+            )
+            return
+
+        slot_tokens = getattr(bsr_output, 'slot_tokens', None)
+        slot_logits = getattr(bsr_output, 'slot_logits', None)
+        if slot_tokens is None or slot_logits is None or slot_tokens.numel() == 0 or slot_logits.numel() == 0:
+            return
+
+        point_indices, candidate_rows, raw_points = build_bsr_candidate_point_cloud(
+            nag=nag,
+            raw_keys=getattr(self, 'bsr_raw_keys', ['pos', 'rgb']),
+            candidate_indices=candidate_indices,
+            device=superpoint_logits.device,
+        )
+        if point_indices.numel() == 0:
+            return
+
+        chunk_size = max(int(getattr(self, 'bsr_propagation_chunk_size', 200000)), 1)
+        store_affinity = bool(getattr(self, 'bsr_store_slot_affinity', False))
+        slot_affinity = None
+        if store_affinity:
+            slot_affinity = point_logits.new_zeros((point_logits.shape[0], slot_logits.shape[1]))
+
+        with torch.no_grad():
+            for start in range(0, point_indices.numel(), chunk_size):
+                end = min(start + chunk_size, point_indices.numel())
+                rows = candidate_rows[start:end].to(device=superpoint_logits.device, dtype=torch.long)
+                points = point_indices[start:end].to(device=superpoint_logits.device, dtype=torch.long)
+                raw_chunk = raw_points[start:end].to(device=superpoint_logits.device, dtype=superpoint_logits.dtype)
+                centroids = nag[1].pos.to(device=superpoint_logits.device, dtype=superpoint_logits.dtype)[
+                    candidate_indices.to(device=superpoint_logits.device, dtype=torch.long)[rows]
+                ]
+                point_tokens = self.bsr.refiner.encode_candidate_points(raw_chunk, centroids)
+                local_logits, affinity = self.bsr.refiner.propagate_slot_logits(
+                    point_tokens=point_tokens,
+                    slot_tokens=slot_tokens.to(device=superpoint_logits.device, dtype=point_tokens.dtype)[rows],
+                    slot_logits=slot_logits.to(device=superpoint_logits.device, dtype=point_tokens.dtype)[rows],
+                )
+                coarse_base = coarse_candidate_logits.to(
+                    device=superpoint_logits.device,
+                    dtype=local_logits.dtype,
+                )[rows]
+                point_logits[points] = (
+                    (1.0 - alpha) * coarse_base + alpha * local_logits
+                ).to(dtype=point_logits.dtype)
+                propagation_mask[points] = True
+                if slot_affinity is not None:
+                    slot_affinity[points] = affinity.to(dtype=slot_affinity.dtype)
+
+        bsr_output.point_logits = point_logits
+        bsr_output.point_propagation_mask = propagation_mask
+        bsr_output.point_propagation_coverage = float(
+            propagation_mask.float().mean().detach().item()
+        )
+        bsr_output.slot_affinity = slot_affinity
+
+    def _update_semantic_confusion_matrix(
+            self,
+            cm: ConfusionMatrix,
+            output: SemanticSegmentationOutput) -> None:
+        if (
+            getattr(self, 'bsr_metric_level', 'point') == 'point'
+            and getattr(output, 'point_y', None) is not None
+            and (
+                getattr(output, 'point_logits', None) is not None
+                or getattr(output, 'super_index', None) is not None
+            )
+        ):
+            cm(
+                output.point_semantic_pred().detach(),
+                output.point_y.detach())
+            return
+
+        cm(
+            output.semantic_pred().detach(),
+            output.semantic_target.detach())
+
+    def _resolve_bsr_raw_keys(self, nag: NAG) -> None:
+        if self._bsr_raw_keys_resolved:
+            return
+
+        preferred_keys = list(getattr(self, 'bsr_raw_keys', ['pos', 'rgb']))
+        expected_d_raw = None
+        if self.bsr is not None and getattr(self.bsr, 'refiner', None) is not None:
+            encoder_layer = self.bsr.refiner.point_encoder[0]
+            encoder_weight = getattr(encoder_layer, 'weight', None)
+            if torch.is_tensor(encoder_weight) and encoder_weight.ndim == 2:
+                expected_d_raw = int(encoder_weight.shape[1])
+            else:
+                in_features = getattr(encoder_layer, 'in_features', None)
+                if isinstance(in_features, int) and in_features > 0:
+                    expected_d_raw = int(in_features)
+
+        resolved_keys = _resolve_available_bsr_raw_keys(
+            nag[0],
+            preferred_keys=preferred_keys,
+            expected_d_raw=expected_d_raw,
+        )
+
+        if not resolved_keys:
+            raise ValueError("BSR could not resolve any raw_keys from level-0 attributes")
+
+        if expected_d_raw is not None:
+            resolved_d_raw = sum(_point_attr_dim(getattr(nag[0], key, None)) for key in resolved_keys)
+            if resolved_keys != preferred_keys:
+                log.warning(
+                    "BSR: adapted raw point attributes for checkpoint-compatible d_raw=%s: %s -> %s",
+                    expected_d_raw,
+                    preferred_keys,
+                    resolved_keys,
+                )
+            if resolved_d_raw != expected_d_raw:
+                log.warning(
+                    "BSR: resolved raw point attributes %s produce d_raw=%s, "
+                    "but the refiner expects d_raw=%s. Forward may fall back to baseline.",
+                    resolved_keys,
+                    resolved_d_raw,
+                    expected_d_raw,
+                )
+
+        self.bsr_raw_keys = resolved_keys
+        self._bsr_raw_keys_resolved = True
+        log.info("BSR: resolved raw point attributes for packing: %s", self.bsr_raw_keys)
 
     def _extract_handcrafted_features(self, nag) -> 'Optional[torch.Tensor]':
         """
@@ -369,32 +992,22 @@ class SemanticSegmentationModule(LightningModule):
             return None
         
         sp_data = nag[1]
-        M = sp_data.num_nodes if hasattr(sp_data, 'num_nodes') else sp_data.pos.shape[0]
         device = sp_data.pos.device
-        
-        features = []
-        missing_keys = []
-        for key in self._geo_feature_keys:
-            if hasattr(sp_data, key) and getattr(sp_data, key) is not None:
-                attr = getattr(sp_data, key)
-                if attr.dim() == 1:
-                    attr = attr.unsqueeze(-1)
-                features.append(attr.to(device))
-            else:
-                missing_keys.append(key)
-                features.append(torch.zeros(M, 1, device=device))
+        result, missing_keys = extract_selector_handcrafted_features(
+            nag=nag,
+            preferred_keys=self._geo_feature_keys,
+            device=device,
+        )
         
         # 首次缺失时记录 warning
         if missing_keys and not self._geo_missing_warned:
             log.warning(
-                f"AUS 几何特征缺失 {missing_keys}，对应通道补 0。"
-                f"如果全部缺失，AUS 将退化为纯语义熵采样。"
+                f"候选先验所需几何特征缺失 {missing_keys}，对应通道补 0。"
+                f"如果全部缺失，几何项将被跳过，仅保留语义不确定性与边界代理。"
             )
             self._geo_missing_warned = True
-        
-        result = torch.cat(features, dim=-1)  # [M, D_geo]
-        
-        # 如果全部是零（全部缺失），返回 None 以避免 AUS 几何分支产生干扰
+
+        # 如果全部缺失，则返回 None，避免几何项对候选先验产生伪信号
         if len(missing_keys) == len(self._geo_feature_keys):
             return None
         
@@ -440,81 +1053,95 @@ class SemanticSegmentationModule(LightningModule):
         """
         前向传播。
         
-        若启用 H-SPT，会执行以下额外操作：
-        1. 使用 AUS 筛选困难超点
-        2. 使用 CAFM 增强特征
-        3. 使用 RRH 输出点级预测
+        若启用 BSR，会执行以下额外操作：
+        1. 使用 Boundary Prior Selector 选择高风险超点
+        2. 使用真正的 superpoint-query / point-key-value cross-attention 细化候选区域
+        3. 将局部细化结果反馈到 superpoint 语义预测
         """
+        if self.bsr_enabled:
+            self._resolve_bsr_raw_keys(nag)
+
         x = self.net(nag)
         
-        # 获取超点特征（用于主分类头和 H-SPT）
+        # 获取超点特征（用于主分类头和局部细化模块）
         sp_features = x[0] if self.multi_stage_loss else x
         
         # 计算粗分类 logits
         coarse_logits = self.head[0](sp_features) if self.multi_stage_loss else self.head(sp_features)
         
         # ===========================
-        # H-SPT 集成
+        # BSR 集成
         # ===========================
-        hspt_output = None
-        if self.hspt_enabled and self.hspt is not None:
-            self._hspt_total_count += 1
+        bsr_output = None
+        if self.bsr_enabled and self.bsr is not None:
+            bsr_stage = self._current_bsr_stage()
+            self._bsr_total_count += 1
+            if bsr_stage in self._bsr_stage_total_count:
+                self._bsr_stage_total_count[bsr_stage] += 1
             try:
-                # 获取超点质心
                 sp_centroids = nag[1].pos if hasattr(nag[1], 'pos') else None
-                
                 if sp_centroids is not None:
-                    # 构建 packed 点张量
-                    packed_raw_points, packed_point_idx, packed_mask = build_packed_points(
-                        nag,
-                        n_sample=self.hspt.n_sample,
-                        raw_keys=self.hspt_raw_keys,
-                        device=sp_features.device
-                    )
-                    
-                    # 提取 AUS 几何特征（固定通道契约）
                     handcrafted_feats = self._extract_handcrafted_features(nag)
-                    
-                    # 运行 H-SPT 流水线
-                    hspt_output = self.hspt(
+                    edge_index = nag[1].edge_index if hasattr(nag[1], 'edge_index') else None
+                    candidate_indices, candidate_scores, selector_score_terms = self.bsr.select_candidates(
+                        coarse_logits=coarse_logits,
+                        handcrafted_features=handcrafted_feats,
+                        edge_index=edge_index,
+                    )
+                    candidate_raw_points, candidate_point_idx, candidate_mask = build_bsr_packed_points(
+                        nag,
+                        n_sample=self.bsr.n_sample,
+                        raw_keys=self.bsr_raw_keys,
+                        superpoint_indices=candidate_indices,
+                        device=sp_features.device,
+                        sampling_mode=self.bsr_sampling_mode,
+                        sampling_without_replacement=self.bsr_sampling_without_replacement,
+                    )
+                    bsr_output = self.bsr.refine_candidates(
+                        candidate_indices=candidate_indices,
+                        candidate_scores=candidate_scores,
                         sp_features=sp_features,
                         sp_centroids=sp_centroids,
                         coarse_logits=coarse_logits,
-                        packed_raw_points=packed_raw_points,
-                        packed_mask=packed_mask,
-                        handcrafted_features=handcrafted_feats
+                        candidate_raw_points=candidate_raw_points,
+                        candidate_point_indices=candidate_point_idx,
+                        candidate_point_mask=candidate_mask,
+                        selector_score_terms=selector_score_terms,
+                        sampling_mode=self.bsr_sampling_mode,
                     )
-                    
-                    # 使用融合后的特征重新计算 logits
-                    if hspt_output.fused_features is not None:
-                        sp_features = hspt_output.fused_features
-                        coarse_logits = self.head[0](sp_features) if self.multi_stage_loss else self.head(sp_features)
-
-                    # 将点级细化结果回注到 superpoint logits（训练/推理一致）
-                    coarse_logits = self._fuse_hspt_superpoint_logits(coarse_logits, hspt_output)
-                    
-                    # 保存 packed_point_idx 供 loss 计算使用
-                    hspt_output.packed_point_idx = packed_point_idx
-                    
-                    # 成功：重置连续失败计数
-                    self._hspt_consecutive_fail = 0
+                    bsr_output.warmup_loss_weight = self._current_bsr_loss_weight()
+                    bsr_output.warmup_fusion_alpha = self._current_bsr_fusion_alpha()
+                    if bsr_output.refined_sp_features is not None:
+                        sp_features = bsr_output.refined_sp_features
+                    if bsr_output.candidate_indices is not None and bsr_output.candidate_indices.numel() > 0:
+                        bsr_output.coarse_candidate_logits = coarse_logits[
+                            bsr_output.candidate_indices
+                        ].clone()
+                    coarse_logits = self._fuse_bsr_superpoint_logits(coarse_logits, bsr_output)
+                    if bsr_output.candidate_indices is not None and bsr_output.candidate_indices.numel() > 0:
+                        bsr_output.fused_candidate_logits = coarse_logits[
+                            bsr_output.candidate_indices
+                        ]
+                    self._build_bsr_point_logits(nag, coarse_logits, bsr_output)
+                    self._bsr_consecutive_fail = 0
             except Exception as e:
-                self._hspt_fail_count += 1
-                self._hspt_consecutive_fail += 1
-                
-                # 训练阶段连续失败超过阈值 → 熔断
-                if self.training and self._hspt_consecutive_fail >= self._hspt_fuse_threshold:
+                self._bsr_fail_count += 1
+                self._bsr_consecutive_fail += 1
+                if bsr_stage in self._bsr_stage_fail_count:
+                    self._bsr_stage_fail_count[bsr_stage] += 1
+                if self.training and self._bsr_consecutive_fail >= self._bsr_fuse_threshold:
                     raise RuntimeError(
-                        f"H-SPT 连续失败 {self._hspt_consecutive_fail} 次，触发熔断。"
-                        f"最近错误: {e}"
+                        f"BSR consecutive failures reached {self._bsr_consecutive_fail}. "
+                        f"Latest error: {e}"
                     )
-                
                 log.warning(
-                    f"H-SPT 前向传播失败 ({self._hspt_fail_count}/{self._hspt_total_count}): "
-                    f"{e}，回退到基线模式"
+                    "BSR forward failed (%s/%s): %s. Falling back to baseline logits.",
+                    self._bsr_fail_count,
+                    self._bsr_total_count,
+                    e,
                 )
-                hspt_output = None
-        
+                bsr_output = None
+
         # 构建最终 logits
         if self.multi_stage_loss:
             logits = [coarse_logits] + [head(x_) for head, x_ in zip(self.head[1:], x[1:])]
@@ -526,15 +1153,181 @@ class SemanticSegmentationModule(LightningModule):
         if self.net.store_features:
             output.x = x
         
-        # 附加 H-SPT 输出（供 model_step 计算 refine loss）
-        if hspt_output is not None:
-            output.hspt_output = hspt_output
+        # 附加局部细化输出（供 model_step 计算附加损失）
+        if bsr_output is not None:
+            output.bsr_output = bsr_output
+            if getattr(bsr_output, 'point_logits', None) is not None:
+                output.point_logits = bsr_output.point_logits
         
         return output
+
+    def _attach_bsr_tracking_metadata(self, batch: NAG, bsr_output) -> None:
+        """Attach dense BSR diagnostics to tracked NAG predictions."""
+        candidate_indices = getattr(bsr_output, 'candidate_indices', None)
+        if candidate_indices is None:
+            return
+
+        num_superpoints = batch[1].num_nodes
+        device = batch[1].semantic_pred.device if hasattr(batch[1], 'semantic_pred') else candidate_indices.device
+        candidate_indices = candidate_indices.to(device=device, dtype=torch.long)
+        if candidate_indices.numel() == 0:
+            return
+
+        dense_candidate_mask = torch.zeros(num_superpoints, dtype=torch.bool, device=device)
+        dense_candidate_mask[candidate_indices] = True
+
+        def _scatter_candidate_values(values, dtype=torch.float32):
+            dense = torch.zeros(num_superpoints, dtype=dtype, device=device)
+            if values is None:
+                return dense
+            if torch.is_tensor(values):
+                if values.numel() == 0:
+                    return dense
+                dense[candidate_indices] = values.to(device=device, dtype=dtype)
+                return dense
+            dense[candidate_indices] = torch.as_tensor(values, dtype=dtype, device=device)
+            return dense
+
+        dense_candidate_scores = _scatter_candidate_values(getattr(bsr_output, 'candidate_scores', None))
+        dense_assignment_entropy = _scatter_candidate_values(getattr(bsr_output, 'assignment_entropy', None))
+        dense_secondary_slot_mass = _scatter_candidate_values(getattr(bsr_output, 'secondary_slot_mass', None))
+        dense_slot_diversity = _scatter_candidate_values(getattr(bsr_output, 'slot_diversity', None))
+        dense_dual_slot_active = dense_secondary_slot_mass > 0.2
+
+        batch[1].bsr_candidate_mask = dense_candidate_mask
+        batch[1].bsr_candidate_score = dense_candidate_scores
+        batch[1].bsr_assignment_entropy = dense_assignment_entropy
+        batch[1].bsr_secondary_slot_mass = dense_secondary_slot_mass
+        batch[1].bsr_dual_slot_active = dense_dual_slot_active
+        batch[1].bsr_slot_diversity = dense_slot_diversity
+
+        if getattr(batch[0], 'super_index', None) is not None:
+            point_super_index = batch[0].super_index.to(device=device, dtype=torch.long)
+            batch[0].bsr_candidate_mask = dense_candidate_mask[point_super_index]
+            batch[0].bsr_candidate_score = dense_candidate_scores[point_super_index]
+            batch[0].bsr_assignment_entropy = dense_assignment_entropy[point_super_index]
+            batch[0].bsr_secondary_slot_mass = dense_secondary_slot_mass[point_super_index]
+            batch[0].bsr_dual_slot_active = dense_dual_slot_active[point_super_index]
+            batch[0].bsr_slot_diversity = dense_slot_diversity[point_super_index]
+
+        point_logits = getattr(bsr_output, 'point_logits', None)
+        if point_logits is not None:
+            point_logits = point_logits.to(device=device)
+            batch[0].bsr_point_logits = point_logits
+            batch[0].bsr_point_semantic_pred = torch.argmax(point_logits, dim=1)
+
+        point_mask = getattr(bsr_output, 'point_propagation_mask', None)
+        if point_mask is not None:
+            batch[0].bsr_point_propagation_mask = point_mask.to(device=device, dtype=torch.bool)
+
+        coverage = float(getattr(bsr_output, 'point_propagation_coverage', 0.0))
+        num_level0_points = getattr(batch[0], 'num_nodes', None)
+        if num_level0_points is None:
+            num_level0_points = batch[0].pos.shape[0]
+        batch[0].bsr_point_propagation_coverage = torch.full(
+            (int(num_level0_points),),
+            coverage,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        slot_affinity = getattr(bsr_output, 'slot_affinity', None)
+        if slot_affinity is not None:
+            batch[0].bsr_slot_affinity = slot_affinity.to(device=device, dtype=torch.float32)
 
     @property
     def multi_stage_loss(self) -> bool:
         return isinstance(self.criterion, MultiLoss)
+
+    def _iter_wandb_loggers(self):
+        trainer = getattr(self, 'trainer', None)
+        loggers = getattr(trainer, 'loggers', None) if trainer is not None else None
+        if loggers is None:
+            loggers = [getattr(self, 'logger', None)]
+        elif not isinstance(loggers, (list, tuple)):
+            loggers = [loggers]
+        for logger in loggers:
+            if isinstance(logger, WandbLogger):
+                yield logger
+
+    def _count_parameters(self) -> Tuple[int, int]:
+        return safe_count_parameters(self.parameters())
+
+    def _log_wandb_run_metadata(self) -> None:
+        if self._wandb_run_metadata_logged:
+            return
+        wandb_loggers = list(self._iter_wandb_loggers())
+        if not wandb_loggers:
+            return
+
+        datamodule = getattr(self.trainer, 'datamodule', None)
+        if datamodule is None:
+            return
+
+        dataset = (
+            getattr(datamodule, 'train_dataset', None)
+            or getattr(datamodule, 'val_dataset', None)
+            or getattr(datamodule, 'test_dataset', None))
+        stuff_classes = getattr(dataset, 'stuff_classes', None) if dataset is not None else None
+        config, summary = build_semantic_wandb_metadata(
+            trainer=self.trainer,
+            datamodule=datamodule,
+            model_hparams=self.hparams,
+            num_classes=self.num_classes,
+            class_names=self.class_names,
+            stuff_classes=stuff_classes,
+            bsr_enabled=getattr(self, 'bsr_enabled', False),
+            parameter_counts=self._count_parameters(),
+            commit_hash=get_commit_hash(),
+        )
+
+        metric_patterns = [
+            'train/*',
+            'val/*',
+            'test/*',
+            'lr-*',
+            'run/*',
+        ]
+        for logger in wandb_loggers:
+            experiment = logger.experiment
+            try:
+                experiment.define_metric('epoch')
+                for pattern in metric_patterns:
+                    experiment.define_metric(pattern, step_metric='epoch')
+            except Exception as exc:
+                log.warning("Could not define W&B metric axes: %s", exc)
+            try:
+                experiment.config.update(config, allow_val_change=True)
+                experiment.summary.update(summary)
+            except Exception as exc:
+                log.warning("Could not update W&B run metadata: %s", exc)
+
+        self._wandb_run_metadata_logged = True
+
+    def _update_wandb_fit_summary(self) -> None:
+        wandb_loggers = list(self._iter_wandb_loggers())
+        if not wandb_loggers:
+            return
+
+        checkpoint_callback = getattr(self.trainer, 'checkpoint_callback', None)
+        summary = {
+            'run/completed_epochs': int(getattr(self, 'current_epoch', 0)),
+            'run/global_step': int(getattr(self, 'global_step', 0)),
+        }
+        if checkpoint_callback is not None:
+            summary['run/best_model_path'] = getattr(
+                checkpoint_callback, 'best_model_path', '')
+            summary['run/last_model_path'] = getattr(
+                checkpoint_callback, 'last_model_path', '')
+            best_model_score = getattr(checkpoint_callback, 'best_model_score', None)
+            if best_model_score is not None:
+                summary['run/best_model_score'] = _wandb_safe_value(best_model_score)
+
+        for logger in wandb_loggers:
+            try:
+                logger.experiment.summary.update(summary)
+            except Exception as exc:
+                log.warning("Could not update W&B fit summary: %s", exc)
 
     def on_fit_start(self) -> None:
         # This is a bit of a late initialization for the LightningModule
@@ -555,6 +1348,7 @@ class SemanticSegmentationModule(LightningModule):
             f'LightningDataModule has {num_classes} classes.'
 
         self.class_names = dataset.class_names
+        self._log_wandb_run_metadata()
 
         if not self.hparams.weighted_loss:
             return
@@ -581,6 +1375,9 @@ class SemanticSegmentationModule(LightningModule):
                  f"{self.hparams.track_val_every_n_epoch} and "
                  f"{self.trainer.check_val_every_n_epoch} instead.")
 
+    def on_fit_end(self) -> None:
+        self._update_wandb_fit_summary()
+
     def on_train_start(self) -> None:
         # By default, lightning executes validation step sanity checks
         # before training starts, so we need to make sure `*_best`
@@ -589,6 +1386,27 @@ class SemanticSegmentationModule(LightningModule):
         self.val_miou_best.reset()
         self.val_oa_best.reset()
         self.val_macc_best.reset()
+        self._val_best_epochs.clear()
+
+    def on_train_epoch_start(self) -> None:
+        if getattr(self, 'bsr_enabled', False):
+            self._bsr_consecutive_fail = 0
+            self._bsr_stage_fail_count['train'] = 0
+            self._bsr_stage_total_count['train'] = 0
+
+    def on_validation_epoch_start(self) -> None:
+        garbage_collection_cuda()
+        if getattr(self, 'bsr_enabled', False):
+            self._bsr_consecutive_fail = 0
+            self._bsr_stage_fail_count['val'] = 0
+            self._bsr_stage_total_count['val'] = 0
+
+    def on_test_epoch_start(self) -> None:
+        garbage_collection_cuda()
+        if getattr(self, 'bsr_enabled', False):
+            self._bsr_consecutive_fail = 0
+            self._bsr_stage_fail_count['test'] = 0
+            self._bsr_stage_total_count['test'] = 0
 
     def gc_collect(self) -> None:
         num_steps = self.trainer.fit_loop.epoch_loop._batches_that_stepped + 1
@@ -706,34 +1524,35 @@ class SemanticSegmentationModule(LightningModule):
                     f"Unknown single-stage loss '{self.hparams.loss_type}'")
 
         # ===========================
-        # H-SPT Refine Loss （点级细化损失）
+        # BSR Selective Consistency Learning
         # ===========================
-        if self.hspt_enabled and hasattr(output, 'hspt_output') and output.hspt_output is not None:
-            hspt_out = output.hspt_output
-            if hspt_out.point_logits is not None and hspt_out.point_logits.numel() > 0:
-                try:
-                    # 获取原子点 GT 标签
-                    if isinstance(batch, NAG) and hasattr(batch[0], 'y') and batch[0].y is not None:
-                        gt_labels = batch[0].y
-                        
-                        # 计算 refine loss
-                        refine_loss = compute_refine_loss(
-                            point_logits=hspt_out.point_logits,
-                            packed_point_idx=hspt_out.packed_point_idx,
-                            hard_sp_indices=hspt_out.hard_sp_indices,
-                            gt_labels=gt_labels,
-                            packed_mask=hspt_out.packed_mask,
-                            num_classes=self.num_classes,
-                            ignore_index=self.num_classes
-                        )
-                        
-                        # 加权求和
-                        loss = loss + self.hspt_lambda_refine * refine_loss
-                        
-                        # 保存 refine loss 用于日志
-                        output.refine_loss = refine_loss
-                except Exception as e:
-                    log.warning(f"H-SPT refine loss 计算失败: {e}")
+        if self.bsr_enabled and hasattr(output, 'bsr_output') and output.bsr_output is not None:
+            try:
+                if isinstance(batch, NAG) and hasattr(batch[0], 'y') and batch[0].y is not None:
+                    gt_labels = batch[0].y
+                    bsr_total_loss, bsr_losses = compute_bsr_losses(
+                        bsr_output=output.bsr_output,
+                        gt_labels=gt_labels,
+                        num_classes=self.num_classes,
+                        ignore_index=self.num_classes,
+                        lambda_refine=self.bsr_lambda_refine,
+                        lambda_consistency=self.bsr_lambda_consistency,
+                        lambda_diversity=self.bsr_lambda_diversity,
+                        lambda_boundary=self.bsr_lambda_boundary,
+                        score_weighting=self.bsr_score_weighting,
+                        score_weight_gamma=self.bsr_score_weight_gamma,
+                    )
+                    current_bsr_loss_weight = self._current_bsr_loss_weight()
+                    loss = loss + current_bsr_loss_weight * bsr_total_loss
+                    output.bsr_loss_terms = bsr_losses
+                    output.bsr_loss_weight = torch.tensor(
+                        current_bsr_loss_weight,
+                        device=loss.device,
+                        dtype=loss.dtype,
+                    )
+                    output.refine_loss = bsr_losses["refine_loss"]
+            except Exception as e:
+                log.warning(f"BSR loss computation failed: {e}")
 
         return loss, output
 
@@ -957,6 +1776,10 @@ class SemanticSegmentationModule(LightningModule):
 
         # Store the label histogram in the output object
         output.y_hist = y_hist
+        if getattr(nag[0], 'super_index', None) is not None:
+            output.super_index = nag[0].super_index
+        if getattr(nag[0], 'y', None) is not None:
+            output.point_y = nag[0].y
 
         return output
 
@@ -967,6 +1790,18 @@ class SemanticSegmentationModule(LightningModule):
     ) -> torch.Tensor:
         self._set_log_batch_size(batch)
         loss, output = self.model_step(batch)
+        if not torch.isfinite(loss):
+            log.warning(
+                "Non-finite training loss detected at batch %s; "
+                "skipping optimizer update for this batch.",
+                batch_idx,
+            )
+            loss = torch.zeros(
+                (),
+                device=loss.device,
+                dtype=loss.dtype,
+                requires_grad=True,
+            )
 
         # Update and log metrics
         self.train_step_update_metrics(loss, output)
@@ -987,16 +1822,73 @@ class SemanticSegmentationModule(LightningModule):
         the output object.
         """
         self.train_loss(loss.detach())
-        self.train_cm(
-            output.semantic_pred().detach(),
-            output.semantic_target.detach())
-        # H-SPT refine loss 指标更新（始终 update 避免 compute-before-update 警告）
-        if self.hspt_enabled:
-            if hasattr(output, 'refine_loss') and output.refine_loss is not None:
-                self.train_refine_loss(output.refine_loss.detach())
+        self._update_semantic_confusion_matrix(self.train_cm, output)
+        if self.bsr_enabled:
+            zero = torch.tensor(0.0, device=loss.device)
+            loss_terms = getattr(output, 'bsr_loss_terms', None)
+            bsr_output = getattr(output, 'bsr_output', None)
+            self.train_refine_loss(loss_terms["refine_loss"].detach() if loss_terms else zero)
+            self.train_consistency_loss(loss_terms["consistency_loss"].detach() if loss_terms else zero)
+            self.train_diversity_loss(loss_terms["diversity_loss"].detach() if loss_terms else zero)
+            self.train_boundary_loss(loss_terms["boundary_loss"].detach() if loss_terms else zero)
+            if bsr_output is not None and bsr_output.num_superpoints > 0:
+                mean_score = (
+                    bsr_output.candidate_scores.detach().mean()
+                    if bsr_output.candidate_scores.numel() > 0 else zero
+                )
+                sample_valid_ratio = (
+                    bsr_output.sampled_point_mask.detach().float().mean()
+                    if bsr_output.sampled_point_mask is not None
+                    and bsr_output.sampled_point_mask.numel() > 0 else zero
+                )
+                self.train_candidate_ratio(torch.tensor(bsr_output.candidate_ratio, device=loss.device))
+                self.train_candidate_score(mean_score)
+                self.train_sample_valid_ratio(sample_valid_ratio)
+                self.train_num_valid_sampled_points(
+                    torch.tensor(float(bsr_output.num_valid_sampled_points), device=loss.device))
+                self.train_avg_valid_points_per_candidate(
+                    torch.tensor(bsr_output.avg_valid_points_per_candidate, device=loss.device))
+                self.train_effective_refine_ratio(
+                    torch.tensor(bsr_output.effective_refine_ratio, device=loss.device))
+                self.train_point_gate_mean(
+                    self._current_bsr_point_gate_mean(bsr_output, loss.device))
+                self.train_assignment_entropy(
+                    self._current_bsr_output_mean(bsr_output, 'assignment_entropy', loss.device))
+                self.train_secondary_slot_mass(
+                    self._current_bsr_output_mean(bsr_output, 'secondary_slot_mass', loss.device))
+                self.train_dual_slot_activation_ratio(
+                    self._current_bsr_output_mean(bsr_output, 'dual_slot_activation_ratio', loss.device))
+                self.train_slot_diversity(
+                    self._current_bsr_output_mean(bsr_output, 'slot_diversity', loss.device))
+                self.train_point_propagation_coverage(
+                    torch.tensor(
+                        float(getattr(bsr_output, 'point_propagation_coverage', 0.0)),
+                        device=loss.device))
+                selector_terms = getattr(bsr_output, 'selector_score_terms', {}) or {}
+                selector_summary = getattr(bsr_output, 'selector_score_summary', {}) or {}
+                for term, metric in self.train_bsr_selector_terms.items():
+                    term_values = selector_terms.get(term)
+                    metric(term_values.detach().mean() if term_values is not None and term_values.numel() > 0 else zero)
+                for term, metric in self.train_bsr_selector_term_vars.items():
+                    term_summary = selector_summary.get(term, {})
+                    metric(torch.tensor(term_summary.get("var", 0.0), device=loss.device))
             else:
-                self.train_refine_loss(torch.tensor(0.0, device=loss.device))
-
+                self.train_candidate_ratio(zero)
+                self.train_candidate_score(zero)
+                self.train_sample_valid_ratio(zero)
+                self.train_num_valid_sampled_points(zero)
+                self.train_avg_valid_points_per_candidate(zero)
+                self.train_effective_refine_ratio(zero)
+                self.train_point_gate_mean(zero)
+                self.train_assignment_entropy(zero)
+                self.train_secondary_slot_mass(zero)
+                self.train_dual_slot_activation_ratio(zero)
+                self.train_slot_diversity(zero)
+                self.train_point_propagation_coverage(zero)
+                for metric in self.train_bsr_selector_terms.values():
+                    metric(zero)
+                for metric in self.train_bsr_selector_term_vars.values():
+                    metric(zero)
     def train_step_log_metrics(self) -> None:
         """Log train metrics after a single step with the content of the
         output object.
@@ -1009,26 +1901,159 @@ class SemanticSegmentationModule(LightningModule):
             on_epoch=True,
             prog_bar=True,
             batch_size=batch_size)
-        # H-SPT refine loss 和 fail_rate 日志
-        if self.hspt_enabled:
+        if self.bsr_enabled:
             self.log(
-                "train/refine_loss",
+                "train/bsr_refine_loss",
                 self.train_refine_loss,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=False,
                 batch_size=batch_size)
-            # 上报失败率
-            if self._hspt_total_count > 0:
-                fail_rate = self._hspt_fail_count / self._hspt_total_count
+            self.log(
+                "train/bsr_consistency_loss",
+                self.train_consistency_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_diversity_loss",
+                self.train_diversity_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_boundary_loss",
+                self.train_boundary_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_candidate_ratio",
+                self.train_candidate_ratio,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_candidate_score",
+                self.train_candidate_score,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_sample_valid_ratio",
+                self.train_sample_valid_ratio,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_num_valid_sampled_points",
+                self.train_num_valid_sampled_points,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_avg_valid_points_per_candidate",
+                self.train_avg_valid_points_per_candidate,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_effective_refine_ratio",
+                self.train_effective_refine_ratio,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_point_gate_mean",
+                self.train_point_gate_mean,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_assignment_entropy",
+                self.train_assignment_entropy,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_secondary_slot_mass",
+                self.train_secondary_slot_mass,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_dual_slot_activation_ratio",
+                self.train_dual_slot_activation_ratio,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_slot_diversity",
+                self.train_slot_diversity,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_point_propagation_coverage",
+                self.train_point_propagation_coverage,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            for term, metric in self.train_bsr_selector_terms.items():
                 self.log(
-                    "train/hspt_fail_rate",
+                    f"train/bsr_selector_{term}",
+                    metric,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=batch_size)
+            for term, metric in self.train_bsr_selector_term_vars.items():
+                self.log(
+                    f"train/bsr_selector_{term}_var",
+                    metric,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=batch_size)
+            self.log(
+                "train/bsr_aux_weight",
+                self._current_bsr_loss_weight(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "train/bsr_fusion_alpha",
+                self._current_bsr_fusion_alpha(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            train_total = self._bsr_stage_total_count.get('train', 0)
+            if train_total > 0:
+                fail_rate = self._bsr_stage_fail_count.get('train', 0) / train_total
+                self.log(
+                    "train/bsr_fail_rate",
                     fail_rate,
                     on_step=False,
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=batch_size)
-
     def on_train_epoch_end(self) -> None:
         self._on_train_epoch_end(
             cm=self.train_cm,
@@ -1171,16 +2196,73 @@ class SemanticSegmentationModule(LightningModule):
         object.
         """
         self.val_loss(loss.detach())
-        self.val_cm(
-            output.semantic_pred().detach(),
-            output.semantic_target.detach())
-        # H-SPT val refine loss
-        if self.hspt_enabled:
-            if hasattr(output, 'refine_loss') and output.refine_loss is not None:
-                self.val_refine_loss(output.refine_loss.detach())
+        self._update_semantic_confusion_matrix(self.val_cm, output)
+        if self.bsr_enabled:
+            zero = torch.tensor(0.0, device=loss.device)
+            loss_terms = getattr(output, 'bsr_loss_terms', None)
+            bsr_output = getattr(output, 'bsr_output', None)
+            self.val_refine_loss(loss_terms["refine_loss"].detach() if loss_terms else zero)
+            self.val_consistency_loss(loss_terms["consistency_loss"].detach() if loss_terms else zero)
+            self.val_diversity_loss(loss_terms["diversity_loss"].detach() if loss_terms else zero)
+            self.val_boundary_loss(loss_terms["boundary_loss"].detach() if loss_terms else zero)
+            if bsr_output is not None and bsr_output.num_superpoints > 0:
+                mean_score = (
+                    bsr_output.candidate_scores.detach().mean()
+                    if bsr_output.candidate_scores.numel() > 0 else zero
+                )
+                sample_valid_ratio = (
+                    bsr_output.sampled_point_mask.detach().float().mean()
+                    if bsr_output.sampled_point_mask is not None
+                    and bsr_output.sampled_point_mask.numel() > 0 else zero
+                )
+                self.val_candidate_ratio(torch.tensor(bsr_output.candidate_ratio, device=loss.device))
+                self.val_candidate_score(mean_score)
+                self.val_sample_valid_ratio(sample_valid_ratio)
+                self.val_num_valid_sampled_points(
+                    torch.tensor(float(bsr_output.num_valid_sampled_points), device=loss.device))
+                self.val_avg_valid_points_per_candidate(
+                    torch.tensor(bsr_output.avg_valid_points_per_candidate, device=loss.device))
+                self.val_effective_refine_ratio(
+                    torch.tensor(bsr_output.effective_refine_ratio, device=loss.device))
+                self.val_point_gate_mean(
+                    self._current_bsr_point_gate_mean(bsr_output, loss.device))
+                self.val_assignment_entropy(
+                    self._current_bsr_output_mean(bsr_output, 'assignment_entropy', loss.device))
+                self.val_secondary_slot_mass(
+                    self._current_bsr_output_mean(bsr_output, 'secondary_slot_mass', loss.device))
+                self.val_dual_slot_activation_ratio(
+                    self._current_bsr_output_mean(bsr_output, 'dual_slot_activation_ratio', loss.device))
+                self.val_slot_diversity(
+                    self._current_bsr_output_mean(bsr_output, 'slot_diversity', loss.device))
+                self.val_point_propagation_coverage(
+                    torch.tensor(
+                        float(getattr(bsr_output, 'point_propagation_coverage', 0.0)),
+                        device=loss.device))
+                selector_terms = getattr(bsr_output, 'selector_score_terms', {}) or {}
+                selector_summary = getattr(bsr_output, 'selector_score_summary', {}) or {}
+                for term, metric in self.val_bsr_selector_terms.items():
+                    term_values = selector_terms.get(term)
+                    metric(term_values.detach().mean() if term_values is not None and term_values.numel() > 0 else zero)
+                for term, metric in self.val_bsr_selector_term_vars.items():
+                    term_summary = selector_summary.get(term, {})
+                    metric(torch.tensor(term_summary.get("var", 0.0), device=loss.device))
             else:
-                self.val_refine_loss(torch.tensor(0.0, device=loss.device))
-
+                self.val_candidate_ratio(zero)
+                self.val_candidate_score(zero)
+                self.val_sample_valid_ratio(zero)
+                self.val_num_valid_sampled_points(zero)
+                self.val_avg_valid_points_per_candidate(zero)
+                self.val_effective_refine_ratio(zero)
+                self.val_point_gate_mean(zero)
+                self.val_assignment_entropy(zero)
+                self.val_secondary_slot_mass(zero)
+                self.val_dual_slot_activation_ratio(zero)
+                self.val_slot_diversity(zero)
+                self.val_point_propagation_coverage(zero)
+                for metric in self.val_bsr_selector_terms.values():
+                    metric(zero)
+                for metric in self.val_bsr_selector_term_vars.values():
+                    metric(zero)
     def validation_step_log_metrics(self) -> None:
         """Log validation metrics after a single step with the content
         of the output object.
@@ -1189,16 +2271,158 @@ class SemanticSegmentationModule(LightningModule):
         self.log(
             "val/loss", self.val_loss, on_step=False, on_epoch=True,
             prog_bar=True, batch_size=batch_size)
-        # H-SPT val refine loss 日志
-        if self.hspt_enabled:
+        if self.bsr_enabled:
             self.log(
-                "val/refine_loss",
+                "val/bsr_refine_loss",
                 self.val_refine_loss,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=False,
                 batch_size=batch_size)
-
+            self.log(
+                "val/bsr_consistency_loss",
+                self.val_consistency_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_diversity_loss",
+                self.val_diversity_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_boundary_loss",
+                self.val_boundary_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_candidate_ratio",
+                self.val_candidate_ratio,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_candidate_score",
+                self.val_candidate_score,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_sample_valid_ratio",
+                self.val_sample_valid_ratio,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_num_valid_sampled_points",
+                self.val_num_valid_sampled_points,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_avg_valid_points_per_candidate",
+                self.val_avg_valid_points_per_candidate,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_effective_refine_ratio",
+                self.val_effective_refine_ratio,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_point_gate_mean",
+                self.val_point_gate_mean,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_assignment_entropy",
+                self.val_assignment_entropy,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_secondary_slot_mass",
+                self.val_secondary_slot_mass,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_dual_slot_activation_ratio",
+                self.val_dual_slot_activation_ratio,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_slot_diversity",
+                self.val_slot_diversity,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_point_propagation_coverage",
+                self.val_point_propagation_coverage,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            for term, metric in self.val_bsr_selector_terms.items():
+                self.log(
+                    f"val/bsr_selector_{term}",
+                    metric,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=batch_size)
+            for term, metric in self.val_bsr_selector_term_vars.items():
+                self.log(
+                    f"val/bsr_selector_{term}_var",
+                    metric,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=batch_size)
+            self.log(
+                "val/bsr_aux_weight",
+                self._current_bsr_loss_weight(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "val/bsr_fusion_alpha",
+                self._current_bsr_fusion_alpha(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            val_total = self._bsr_stage_total_count.get('val', 0)
+            if val_total > 0:
+                self.log(
+                    "val/bsr_fail_rate",
+                    self._bsr_stage_fail_count.get('val', 0) / val_total,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=batch_size)
     def _on_eval_epoch_end(
             self,
             stage: str,
@@ -1307,17 +2531,27 @@ class SemanticSegmentationModule(LightningModule):
                     rank_zero_only=True)
 
         if stage == 'val' :
+            best_epoch_key = f"val/{prefix}miou_best_epoch"
+            if best_epoch_key in self._val_best_epochs:
+                previous_miou_best = _scalar_float(
+                    miou_best.compute(), default=float('-inf'))
+            else:
+                previous_miou_best = float('-inf')
+            miou_value = _scalar_float(miou, default=float('-inf'))
+            miou_improved = miou_value >= previous_miou_best
+
             # Update best-so-far metrics
             miou_best(miou)
             oa_best(oa)
             macc_best(macc)
+            current_miou_best = miou_best.compute()
 
             # Log best-so-far metrics, using `.compute()` instead of passing
             # the whole torchmetrics object, because otherwise metric would
             # be reset by lightning after each epoch
             self.log(
                 f"val/{prefix}miou_best",
-                miou_best.compute(),
+                current_miou_best,
                 prog_bar=True,
                 rank_zero_only=True)
             self.log(
@@ -1330,6 +2564,26 @@ class SemanticSegmentationModule(LightningModule):
                 macc_best.compute(),
                 prog_bar=True,
                 rank_zero_only=True)
+            self.log(
+                f"val/{prefix}miou_gap_to_best",
+                current_miou_best - miou,
+                prog_bar=False,
+                rank_zero_only=True)
+
+            if miou_improved:
+                self._val_best_epochs[best_epoch_key] = int(self.current_epoch)
+            best_epoch = self._val_best_epochs.get(best_epoch_key)
+            if best_epoch is not None:
+                self.log(
+                    best_epoch_key,
+                    float(best_epoch),
+                    prog_bar=False,
+                    rank_zero_only=True)
+                for logger in self._iter_wandb_loggers():
+                    try:
+                        logger.experiment.summary[best_epoch_key] = best_epoch
+                    except Exception as exc:
+                        log.warning("Could not update W&B best epoch summary: %s", exc)
 
         elif getattr(self.hparams, 'extensive_logging', True) and stage == 'test':
             # Log confusion matrix to wandb
@@ -1382,7 +2636,7 @@ class SemanticSegmentationModule(LightningModule):
         if self.trainer.datamodule.hparams.submit:
             nag = batch if isinstance(batch, NAG) else batch[0]
             l0_pos = nag[0].pos.detach().cpu()
-            l0_pred = output.semantic_pred()[nag[0].super_index].detach().cpu()
+            l0_pred = output.point_semantic_pred(super_index=nag[0].super_index).detach().cpu()
             self.trainer.datamodule.test_dataset.make_submission(
                 batch_idx, l0_pred, l0_pos, submission_dir=self.submission_dir)
 
@@ -1415,16 +2669,73 @@ class SemanticSegmentationModule(LightningModule):
             return
 
         self.test_loss(loss.detach())
-        self.test_cm(
-            output.semantic_pred().detach(),
-            output.semantic_target.detach())
-        # H-SPT test refine loss
-        if self.hspt_enabled:
-            if hasattr(output, 'refine_loss') and output.refine_loss is not None:
-                self.test_refine_loss(output.refine_loss.detach())
+        self._update_semantic_confusion_matrix(self.test_cm, output)
+        if self.bsr_enabled:
+            zero = torch.tensor(0.0, device=loss.device)
+            loss_terms = getattr(output, 'bsr_loss_terms', None)
+            bsr_output = getattr(output, 'bsr_output', None)
+            self.test_refine_loss(loss_terms["refine_loss"].detach() if loss_terms else zero)
+            self.test_consistency_loss(loss_terms["consistency_loss"].detach() if loss_terms else zero)
+            self.test_diversity_loss(loss_terms["diversity_loss"].detach() if loss_terms else zero)
+            self.test_boundary_loss(loss_terms["boundary_loss"].detach() if loss_terms else zero)
+            if bsr_output is not None and bsr_output.num_superpoints > 0:
+                mean_score = (
+                    bsr_output.candidate_scores.detach().mean()
+                    if bsr_output.candidate_scores.numel() > 0 else zero
+                )
+                sample_valid_ratio = (
+                    bsr_output.sampled_point_mask.detach().float().mean()
+                    if bsr_output.sampled_point_mask is not None
+                    and bsr_output.sampled_point_mask.numel() > 0 else zero
+                )
+                self.test_candidate_ratio(torch.tensor(bsr_output.candidate_ratio, device=loss.device))
+                self.test_candidate_score(mean_score)
+                self.test_sample_valid_ratio(sample_valid_ratio)
+                self.test_num_valid_sampled_points(
+                    torch.tensor(float(bsr_output.num_valid_sampled_points), device=loss.device))
+                self.test_avg_valid_points_per_candidate(
+                    torch.tensor(bsr_output.avg_valid_points_per_candidate, device=loss.device))
+                self.test_effective_refine_ratio(
+                    torch.tensor(bsr_output.effective_refine_ratio, device=loss.device))
+                self.test_point_gate_mean(
+                    self._current_bsr_point_gate_mean(bsr_output, loss.device))
+                self.test_assignment_entropy(
+                    self._current_bsr_output_mean(bsr_output, 'assignment_entropy', loss.device))
+                self.test_secondary_slot_mass(
+                    self._current_bsr_output_mean(bsr_output, 'secondary_slot_mass', loss.device))
+                self.test_dual_slot_activation_ratio(
+                    self._current_bsr_output_mean(bsr_output, 'dual_slot_activation_ratio', loss.device))
+                self.test_slot_diversity(
+                    self._current_bsr_output_mean(bsr_output, 'slot_diversity', loss.device))
+                self.test_point_propagation_coverage(
+                    torch.tensor(
+                        float(getattr(bsr_output, 'point_propagation_coverage', 0.0)),
+                        device=loss.device))
+                selector_terms = getattr(bsr_output, 'selector_score_terms', {}) or {}
+                selector_summary = getattr(bsr_output, 'selector_score_summary', {}) or {}
+                for term, metric in self.test_bsr_selector_terms.items():
+                    term_values = selector_terms.get(term)
+                    metric(term_values.detach().mean() if term_values is not None and term_values.numel() > 0 else zero)
+                for term, metric in self.test_bsr_selector_term_vars.items():
+                    term_summary = selector_summary.get(term, {})
+                    metric(torch.tensor(term_summary.get("var", 0.0), device=loss.device))
             else:
-                self.test_refine_loss(torch.tensor(0.0, device=loss.device))
-
+                self.test_candidate_ratio(zero)
+                self.test_candidate_score(zero)
+                self.test_sample_valid_ratio(zero)
+                self.test_num_valid_sampled_points(zero)
+                self.test_avg_valid_points_per_candidate(zero)
+                self.test_effective_refine_ratio(zero)
+                self.test_point_gate_mean(zero)
+                self.test_assignment_entropy(zero)
+                self.test_secondary_slot_mass(zero)
+                self.test_dual_slot_activation_ratio(zero)
+                self.test_slot_diversity(zero)
+                self.test_point_propagation_coverage(zero)
+                for metric in self.test_bsr_selector_terms.values():
+                    metric(zero)
+                for metric in self.test_bsr_selector_term_vars.values():
+                    metric(zero)
     def test_step_log_metrics(self) -> None:
         """Log test metrics after a single step with the content of the
         output object.
@@ -1443,19 +2754,158 @@ class SemanticSegmentationModule(LightningModule):
                 "test/loss", self.test_loss, on_step=False, on_epoch=True,
                 prog_bar=True, batch_size=batch_size)
 
-        self.log(
-            "test/loss", self.test_loss, on_step=False, on_epoch=True,
-            prog_bar=True, batch_size=batch_size)
-
-        if self.hspt_enabled:
+        if self.bsr_enabled:
             self.log(
-                "test/refine_loss",
+                "test/bsr_refine_loss",
                 self.test_refine_loss,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=False,
                 batch_size=batch_size)
-
+            self.log(
+                "test/bsr_consistency_loss",
+                self.test_consistency_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_diversity_loss",
+                self.test_diversity_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_boundary_loss",
+                self.test_boundary_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_candidate_ratio",
+                self.test_candidate_ratio,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_candidate_score",
+                self.test_candidate_score,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_sample_valid_ratio",
+                self.test_sample_valid_ratio,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_num_valid_sampled_points",
+                self.test_num_valid_sampled_points,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_avg_valid_points_per_candidate",
+                self.test_avg_valid_points_per_candidate,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_effective_refine_ratio",
+                self.test_effective_refine_ratio,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_point_gate_mean",
+                self.test_point_gate_mean,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_assignment_entropy",
+                self.test_assignment_entropy,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_secondary_slot_mass",
+                self.test_secondary_slot_mass,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_dual_slot_activation_ratio",
+                self.test_dual_slot_activation_ratio,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_slot_diversity",
+                self.test_slot_diversity,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_point_propagation_coverage",
+                self.test_point_propagation_coverage,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            for term, metric in self.test_bsr_selector_terms.items():
+                self.log(
+                    f"test/bsr_selector_{term}",
+                    metric,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=batch_size)
+            for term, metric in self.test_bsr_selector_term_vars.items():
+                self.log(
+                    f"test/bsr_selector_{term}_var",
+                    metric,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=batch_size)
+            self.log(
+                "test/bsr_aux_weight",
+                self._current_bsr_loss_weight(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            self.log(
+                "test/bsr_fusion_alpha",
+                self._current_bsr_fusion_alpha(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=batch_size)
+            test_total = self._bsr_stage_total_count.get('test', 0)
+            if test_total > 0:
+                self.log(
+                    "test/bsr_fail_rate",
+                    self._bsr_stage_fail_count.get('test', 0) / test_total,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=batch_size)
     def on_test_epoch_end(self) -> None:
         self._on_eval_epoch_end(
             stage='test',
@@ -1527,8 +2977,12 @@ class SemanticSegmentationModule(LightningModule):
             batch[1].logits = logits
 
             # Store level-0 (voxel-wise) predictions and logits
-            batch[0].semantic_pred = pred[batch[0].super_index]
-            batch[0].logits = logits[batch[0].super_index]
+            if getattr(output, 'point_logits', None) is not None:
+                batch[0].logits = output.point_logits
+                batch[0].semantic_pred = torch.argmax(output.point_logits, dim=1)
+            else:
+                batch[0].semantic_pred = pred[batch[0].super_index]
+                batch[0].logits = logits[batch[0].super_index]
 
         else:
             for i, _logits in enumerate(output.logits):
@@ -1542,8 +2996,15 @@ class SemanticSegmentationModule(LightningModule):
                 # Store level-0 (voxel-wise) predictions and logits
                 if i > 0:
                     continue
-                batch[0].semantic_pred = pred[batch[0].super_index]
-                batch[0].logits = logits[batch[0].super_index]
+                if getattr(output, 'point_logits', None) is not None:
+                    batch[0].logits = output.point_logits
+                    batch[0].semantic_pred = torch.argmax(output.point_logits, dim=1)
+                else:
+                    batch[0].semantic_pred = pred[batch[0].super_index]
+                    batch[0].logits = logits[batch[0].super_index]
+
+        if hasattr(output, 'bsr_output') and output.bsr_output is not None:
+            self._attach_bsr_tracking_metadata(batch, output.bsr_output)
 
         # Detach the batch object and move it to CPU before saving
         batch = batch.detach().cpu()

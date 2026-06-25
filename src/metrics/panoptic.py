@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 import logging
 from torch_scatter import scatter_sum
@@ -5,7 +7,6 @@ from torch import Tensor, LongTensor
 from typing import Any, List, Optional, Sequence
 from torchmetrics.metric import Metric
 from torch_geometric.nn.pool.consecutive import consecutive_cluster
-from src.data import InstanceData, InstanceBatch
 from src.metrics.mean_average_precision import BaseMetricResults
 
 
@@ -186,6 +187,8 @@ class PanopticQuality3D(Metric):
             instance_data: InstanceData):
         """Sanity checks executed on the input of `self.update()`.
         """
+        from src.data import InstanceData
+
         if not isinstance(prediction_semantic, Tensor):
             raise ValueError(
                 "Expected argument `prediction_semantic` to be of type Tensor")
@@ -213,6 +216,8 @@ class PanopticQuality3D(Metric):
         data points. Said otherwise, all points belong to one and only
         one prediction and one and only one target.
         """
+        from src.data import InstanceBatch
+
         if len(self.prediction_semantic) == 0:
             log.warning("PanopticQuality3D: No predictions available to compute. Returning NaN/Zero metrics.")
             metrics = PanopticMetricResults()

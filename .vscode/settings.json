@@ -1,0 +1,24 @@
+{
+  "latex-workshop.view.pdf.viewer": "legacy",
+  "latex-workshop.synctex.afterBuild.enabled": true,
+  "latex-workshop.latex.autoBuild.run": "onSave",
+  "latex-workshop.latex.outDir": "%DIR%/build",
+  "latex-workshop.latex.recipes": [
+    {
+      "name": "Build IEEE Paper",
+      "tools": [
+        "build_ieee_paper"
+      ]
+    }
+  ],
+  "latex-workshop.latex.tools": [
+    {
+      "name": "build_ieee_paper",
+      "command": "/bin/bash",
+      "args": [
+        "-lc",
+        "export PATH=/home/jts/.TinyTeX/bin/x86_64-linux:$PATH && /workspace/exos_8t_0/jts/OpenIns3D_new/superpoint_transformer/scripts/build_latex_paper.sh"
+      ]
+    }
+  ]
+}

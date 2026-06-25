@@ -11,8 +11,12 @@ devices: 1
 # mixed precision for extra speed-up
 # precision: 16
 
+# gradient clipping to prevent gradient explosion (NaNs)
+gradient_clip_val: 1.0
+
 # perform a validation loop every N training epochs
 check_val_every_n_epoch: 10
+log_every_n_steps: 10
 
 # set True to ensure deterministic results
 # makes training slower but gives more reproducibility than just setting seeds

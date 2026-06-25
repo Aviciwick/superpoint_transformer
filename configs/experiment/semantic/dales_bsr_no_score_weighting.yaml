@@ -1,0 +1,40 @@
+# @package _global_
+
+defaults:
+  - override /datamodule: semantic/dales.yaml
+  - override /model: semantic/spt-2.yaml
+  - override /trainer: gpu.yaml
+
+trainer:
+  max_epochs: 400
+
+model:
+  bsr:
+    enable: true
+    selector:
+      topk_ratio: 0.15
+      score_terms: [uncertainty, geometry, boundary]
+    refiner:
+      n_sample: 64
+      n_heads: 4
+      token_mode: superpoint_query
+      sampling_mode: coverage
+      sampling_without_replacement: true
+    loss:
+      lambda_refine: 0.5
+      lambda_consistency: 0.1
+      lambda_boundary: 0.05
+      global_weight: 0.5
+      warmup_epochs: 10
+      score_weighting: false
+    feedback:
+      logit_fusion_alpha: 0.5
+      warmup_epochs: 10
+  optimizer:
+    lr: 0.01
+    weight_decay: 1e-4
+
+logger:
+  wandb:
+    project: "spt_dales"
+    name: "SPT-64-BSR-NoScoreWeighting"

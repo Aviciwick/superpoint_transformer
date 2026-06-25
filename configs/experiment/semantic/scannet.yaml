@@ -37,3 +37,6 @@ logger:
   wandb:
     project: "spt_scannet"
     name: "SPT-128"
+    group: "scannet/spt"
+    tags: ["semantic", "scannet", "spt", "baseline"]
+    job_type: "semantic_baseline"

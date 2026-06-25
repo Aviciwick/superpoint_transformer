@@ -1,0 +1,141 @@
+# @package datamodule
+defaults:
+  - /datamodule/semantic/default.yaml
+
+_target_: src.datamodules.sensaturban.SensatUrbanDataModule
+
+num_classes: 13
+stuff_classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+instance: false
+trainval: false
+val_on_test: false
+
+# SensatUrban raw blocks have variable physical extents and much higher
+# density than DALES. Build per-file rectangular XY tiles from raw bboxes:
+# birmingham_block_9 is used as the reference and is cut like xy_tiling=3.
+xy_tiling: null
+pc_tiling: null
+adaptive_xy_tiling:
+  enable: true
+  reference_cloud: "birmingham_block_9"
+  reference_xy_tiling: 3
+  target_tile_size: null
+  target_tile_size_xy: null
+  max_tiles_per_axis: 12
+  min_tiles_per_axis: 1
+  min_tile_size: 1.0
+  min_tile_points: 1024
+  chunk_size: 5000000
+  force_rebuild: false
+  manifest_name: "adaptive_xy_tiling_ref_birmingham_block_9_x3_v1.json"
+custom_hash: "sensaturban_spt64_rgb_adaptxy_refb9x3_vox020_cityfixed_pruned_v1"
+in_memory: false
+
+train_clouds: null
+val_clouds: null
+test_clouds: null
+exclude_clouds: null
+split_protocol: "city_fixed"
+val_from_train: false
+val_ratio: 0.2
+val_count: null
+
+dataloader:
+    batch_size: 1
+    num_workers: 8
+
+max_num_nodes: 100000
+max_num_edges: 2000000
+
+partition_hf:
+  - 'rgb'
+  - 'linearity'
+  - 'planarity'
+  - 'scattering'
+  - 'verticality'
+  - 'elevation'
+
+point_hf:
+  - 'rgb'
+  - 'linearity'
+  - 'planarity'
+  - 'scattering'
+  - 'verticality'
+  - 'elevation'
+
+segment_base_hf: []
+segment_mean_hf: []
+segment_std_hf: []
+
+edge_hf:
+  - 'mean_off'
+  - 'std_off'
+  - 'mean_dist'
+  - 'angle_source'
+  - 'angle_target'
+  - 'centroid_dir'
+  - 'centroid_dist'
+  - 'normal_angle'
+  - 'log_length'
+  - 'log_surface'
+  - 'log_volume'
+  - 'log_size'
+
+v_edge_hf: []
+
+voxel: 0.2
+knn: 45
+knn_r: 10
+knn_step: -1
+knn_min_search: 25
+ground_model: 'ransac'
+ground_threshold: 5
+ground_xy_grid: 5
+ground_scale: 20
+pcp_regularization: [0.1, 0.2, 0.3]
+pcp_spatial_weight: [1e-1, 1e-2, 1e-3]
+pcp_edge_reduce: 'mean'
+pcp_cutoff: [10, 30, 100]
+pcp_k_adjacency: 10
+pcp_w_adjacency: 1
+pcp_iterations: 15
+pcp_parallel: true
+graph_k_min: 1
+graph_k_max: 30
+graph_gap: [5, 30, 30]
+graph_se_ratio: 0.3
+graph_se_min: 20
+graph_cycles: 3
+graph_margin: 0.5
+graph_chunk: [1e6, 1e5, 1e5]
+
+sample_segment_ratio: 0.2
+sample_segment_by_size: true
+sample_segment_by_class: false
+sample_point_min: 32
+sample_point_max: 128
+sample_graph_r: 50
+sample_graph_k: 4
+sample_graph_max_nodes: 10000
+sample_graph_disjoint: true
+sample_graph_cylindrical: true
+sample_edge_n_min: -1
+sample_edge_n_max: -1
+
+pos_jitter: 0.05
+tilt_n_rotate_phi: 0.1
+tilt_n_rotate_theta: 180
+anisotropic_scaling: 0.2
+rgb_jitter: 0
+rgb_autocontrast: 0.5
+rgb_drop: 0.3
+node_feat_jitter: 0
+h_edge_feat_jitter: 0
+v_edge_feat_jitter: 0
+node_feat_drop: 0
+h_edge_feat_drop: 0.3
+v_edge_feat_drop: 0
+node_row_drop: 0
+h_edge_row_drop: 0
+v_edge_row_drop: 0
+drop_to_mean: false

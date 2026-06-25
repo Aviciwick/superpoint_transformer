@@ -1,0 +1,23 @@
+# @package _global_
+
+defaults:
+  - override /datamodule: semantic/toronto3d.yaml
+  - override /model: semantic/spt-2.yaml
+  - override /trainer: gpu.yaml
+
+trainer:
+  max_epochs: 1000
+  precision: 32
+
+model:
+  optimizer:
+    lr: 0.01
+    weight_decay: 1e-4
+
+logger:
+  wandb:
+    project: "spt_toronto3d"
+    name: "SPT-64-Toronto3D-intensity-wholeroad"
+    group: "toronto3d/spt"
+    tags: ["semantic", "toronto3d", "spt", "spt64", "baseline", "intensity", "wholeroad"]
+    job_type: "semantic_baseline"

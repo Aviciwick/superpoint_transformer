@@ -187,6 +187,12 @@ class GridSampling3D(Transform):
         # In-place option will modify the input Data object directly
         data = data_in if self.inplace else data_in.clone()
 
+        if data.num_points == 0:
+            raise ValueError(
+                "GridSampling3D received an empty point cloud. This usually "
+                "means the tiling configuration produced an empty tile; use "
+                "balanced pc_tiling or reduce xy_tiling.")
+
         # If the aggregation mode is 'last', shuffle the points order.
         # Note that voxelization of point attributes will be stochastic
         if self.mode == 'last':
@@ -307,6 +313,10 @@ def _group_data(
                 bins=bins,
                 chunk_size=None)
 
+        pos_offset = getattr(data, 'pos_offset', None)
+        if torch.is_tensor(pos_offset):
+            pos_offset = pos_offset.clone()
+
         data_list = []
         counts = cluster.bincount()
         splits = split_histogram(counts, chunk_size)
@@ -341,12 +351,10 @@ def _group_data(
         if has_obj:
             batch.obj.is_index_value[0] = True
 
-        # TODO: this will not handle well objects which are not of size
-        #  num_points. e.g. if pos_offset is a single scalar for the
-        #  input Data, it will be duplicated for each chunk here. This
-        #  is mostly a duplication problem, so for now we keep this as
-        #  is, even if a bit dirty
-        return batch.forget_batching()
+        out = batch.forget_batching()
+        if pos_offset is not None:
+            out.pos_offset = pos_offset
+        return out
 
     skip_keys = sanitize_keys(skip_keys, default=[])
 
@@ -614,6 +622,11 @@ class SampleRecursiveMainXYAxisTiling(Transform):
     def split_by_main_xy_direction(data, left=True, right=True):
         assert left or right, "At least one split must be returned"
 
+        if data.num_points <= 1:
+            if left and right:
+                return data.clone(), data.clone()
+            return data
+
         # Find the main XY direction and orient it along the x+ halfspace,
         # for repeatability
         v = SampleRecursiveMainXYAxisTiling.compute_main_xy_direction(data)
@@ -624,6 +637,11 @@ class SampleRecursiveMainXYAxisTiling(Transform):
         proj = (data.pos[:, :2] * v.view(1, -1)).sum(dim=1)
         mask = proj < proj.median()
 
+        if not mask.any() or mask.all():
+            order = proj.argsort()
+            mask = torch.zeros_like(proj, dtype=torch.bool)
+            mask[order[:max(1, data.num_points // 2)]] = True
+
         if left and not right:
             return data.select(mask)[0]
         if right and not left:
@@ -632,6 +650,9 @@ class SampleRecursiveMainXYAxisTiling(Transform):
 
     @staticmethod
     def compute_main_xy_direction(data):
+        if data.num_points < 3:
+            return data.pos.new_tensor([1., 0.])
+
         # Work on local copy
         data = Data(pos=data.pos.clone())
 
@@ -639,6 +660,8 @@ class SampleRecursiveMainXYAxisTiling(Transform):
         xy = data.pos[:, :2]
         xy -= xy.min(dim=0).values.view(1, -1)
         voxel = xy.max() / 100
+        if voxel <= 0:
+            return data.pos.new_tensor([1., 0.])
 
         # Set Z to 0, we only want to compute the principal components in XY
         data.pos[:, 2] = 0

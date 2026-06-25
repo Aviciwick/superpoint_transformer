@@ -78,6 +78,7 @@ load_full_res_idx: False
 # training procedures
 max_num_nodes: 50000
 max_num_edges: 1000000
+pcp_parallel: True
 
 # Test-time augmentation
 tta_runs: null
@@ -151,7 +152,7 @@ pre_transform:
         cutoff: ${datamodule.pcp_cutoff}
         iterations: ${datamodule.pcp_iterations}
         edge_reduce: ${datamodule.pcp_edge_reduce}
-        parallel: True
+        parallel: ${datamodule.pcp_parallel}
         verbose: False
     - transform: NAGRemoveKeys  # remove 'x' used for partition (features are still preserved under their respective Data attributes)
       params:

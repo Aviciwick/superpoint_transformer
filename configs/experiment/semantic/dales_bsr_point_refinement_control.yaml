@@ -1,0 +1,21 @@
+# @package _global_
+
+# Generic point-refinement control: single-region point head, no mixture slots.
+
+defaults:
+  - /experiment/semantic/dales_bsr
+
+model:
+  bsr:
+    refiner:
+      variant: single_residual_gated
+      n_subregions: 1
+    loss:
+      lambda_diversity: 0.0
+    propagation:
+      mode: slot_all_points
+      metric_level: point
+
+logger:
+  wandb:
+    name: "SPT-64-BSR-point-refinement-control"

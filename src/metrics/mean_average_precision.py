@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 import logging
 import numpy as np
@@ -26,7 +28,6 @@ except Exception:
             return self
 from torchmetrics.utilities.imports import _TORCHVISION_GREATER_EQUAL_0_8
 from torch_geometric.nn.pool.consecutive import consecutive_cluster
-from src.data import InstanceData, InstanceBatch
 from src.utils import arange_interleave, sizes_to_pointers
 
 
@@ -352,6 +353,8 @@ class MeanAveragePrecision3D(MeanAveragePrecision):
             instance_data: InstanceData):
         """Sanity checks executed on the input of `self.update()`.
         """
+        from src.data import InstanceData
+
         if not isinstance(prediction_score, Tensor):
             raise ValueError(
                 "Expected argument `prediction_score` to be of type Tensor")
@@ -383,6 +386,8 @@ class MeanAveragePrecision3D(MeanAveragePrecision):
     def compute(self) -> dict:
         """Metrics computation.
         """
+        from src.data import InstanceBatch
+
         # Batch together the values stored in the internal states.
         # Importantly, the InstanceBatch mechanism ensures there is no
         # collision between object labels of the stored scenes

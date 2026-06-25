@@ -1,0 +1,63 @@
+# @package model
+# BSR-SPT (Boundary-aware Selective Refinement for Superpoint Transformer)
+# New writing-oriented semantic refinement interface for TGRS-style research.
+
+bsr:
+  enable: false
+
+  # Raw point attributes used for candidate-region point packing.
+  raw_keys:
+    - pos
+    - rgb
+
+  selector:
+    topk_ratio: 0.15
+    score_terms:
+      - uncertainty
+      - geometry
+      - boundary
+    term_weights:
+      uncertainty: 0.5
+      geometry: 0.25
+      boundary: 0.25
+    scatter_idx: 2
+
+  refiner:
+    n_sample: 64
+    d_raw: 6
+    n_heads: 4
+    token_mode: superpoint_query
+    dropout: 0.1
+    hidden_dim: null
+    variant: mixture
+    n_subregions: 2
+    assignment_temperature: 1.0
+    use_boundary_head: true
+    sampling_mode: coverage
+    sampling_without_replacement: true
+
+  loss:
+    lambda_refine: 0.5
+    lambda_consistency: 0.1
+    lambda_diversity: 0.02
+    lambda_boundary: 0.05
+    global_weight: 0.5
+    warmup_epochs: 10
+    score_weighting: true
+    score_weight_gamma: 1.0
+
+  feedback:
+    logit_fusion_alpha: 0.5
+    warmup_epochs: 10
+
+  propagation:
+    mode: slot_all_points
+    chunk_size: 200000
+    store_slot_affinity: false
+    dual_slot_threshold: 0.2
+    metric_level: point
+
+  partition_adapter:
+    enable: false
+    min_points_per_sp: 3
+    merge_small_clusters: true

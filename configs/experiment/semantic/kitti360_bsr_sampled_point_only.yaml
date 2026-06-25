@@ -1,0 +1,16 @@
+# @package _global_
+
+# Sampled-point-only propagation control for KITTI-360.
+
+defaults:
+  - /experiment/semantic/kitti360_bsr
+
+model:
+  bsr:
+    propagation:
+      mode: sampled_point_only
+      metric_level: point
+
+logger:
+  wandb:
+    name: "SPT-64-BSR-KITTI360-sampled-point-only"

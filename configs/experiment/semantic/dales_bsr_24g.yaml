@@ -1,0 +1,19 @@
+# @package _global_
+#
+# DALES-BSR configuration tuned for a single 24G GPU such as RTX 3090.
+# Relative to `semantic/dales_bsr`, this keeps validation-time memory
+# steadier by using smaller tiles and mixed precision.
+
+defaults:
+  - /experiment/semantic/dales_bsr
+
+datamodule:
+  xy_tiling: 4
+
+trainer:
+  precision: 16
+  max_epochs: 225  # keep the total number of optimization steps close to the 3x3 tiling setup
+
+logger:
+  wandb:
+    name: "SPT-64-BSR-24G"

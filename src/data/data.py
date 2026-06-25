@@ -1172,6 +1172,20 @@ class Batch(PyGBatch, Data):
             for d in data_list:
                 d.raise_if_edge_keys()
 
+            # Some sampled subgraphs can carry level-0 full-resolution
+            # backtracking clusters (`sub`) while degenerate/full-copy
+            # subgraphs from the same mini-batch do not. PyG collate
+            # requires all stores to expose the same keys, so partial
+            # optional hierarchy metadata must be removed consistently.
+            for key in ['sub']:
+                has_key = [
+                    key in d.to_dict() and getattr(d, key, None) is not None
+                    for d in data_list]
+                if any(has_key) and not all(has_key):
+                    for d, present in zip(data_list, has_key):
+                        if present:
+                            del d[key]
+
             # Little trick to prevent Batch.from_data_list from crashing
             # when some Data objects have edges while others don't
             has = [

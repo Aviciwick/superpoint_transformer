@@ -23,3 +23,6 @@ logger:
   wandb:
     project: "spt_dales"
     name: "SPT-64"
+    group: "dales/spt"
+    tags: ["semantic", "dales", "spt", "baseline"]
+    job_type: "semantic_baseline"

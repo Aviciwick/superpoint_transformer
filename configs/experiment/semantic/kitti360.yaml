@@ -30,3 +30,6 @@ logger:
   wandb:
     project: "spt_kitti360"
     name: "SPT-128"
+    group: "kitti360/spt"
+    tags: ["semantic", "kitti360", "spt", "baseline"]
+    job_type: "semantic_baseline"

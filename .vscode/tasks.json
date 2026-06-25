@@ -1,0 +1,58 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "LaTeX: Setup TinyTeX",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "${workspaceFolder}/scripts/setup_latex_env.sh"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "LaTeX: Build IEEE Paper",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "${workspaceFolder}/scripts/build_latex_paper.sh"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "LaTeX: Watch IEEE Paper",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "${workspaceFolder}/scripts/watch_latex_paper.sh"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "LaTeX: Clean IEEE Paper",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "${workspaceFolder}/scripts/clean_latex_paper.sh"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

@@ -19,7 +19,7 @@ def init_config(config_name='train.yaml', overrides=[]):
     cwd_bckp = os.getcwd()
     os.chdir(os.path.dirname(__file__))
     try:
-        with initialize(config_path="../../configs"):
+        with initialize(version_base="1.3", config_path="../../configs"):
             cfg = compose(config_name=config_name, overrides=overrides)
     finally:
         os.chdir(cwd_bckp)

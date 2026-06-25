@@ -1,0 +1,23 @@
+# @package _global_
+
+defaults:
+  - override /datamodule: semantic/sensaturban.yaml
+  - override /model: semantic/spt-2.yaml
+  - override /trainer: gpu.yaml
+
+trainer:
+  max_epochs: 400
+  precision: 32
+
+model:
+  optimizer:
+    lr: 0.01
+    weight_decay: 1e-4
+
+logger:
+  wandb:
+    project: "spt_sensaturban"
+    name: "SPT-64-SensatUrban"
+    group: "sensaturban/spt"
+    tags: ["semantic", "sensaturban", "spt", "spt64", "baseline", "rgb", "xy3"]
+    job_type: "semantic_baseline"

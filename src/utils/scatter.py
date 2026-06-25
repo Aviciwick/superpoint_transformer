@@ -152,6 +152,11 @@ def scatter_nearest_neighbor(
         "Does not support duplicate edges, please coalesce the edges" \
         " before calling this function"
 
+    if edge_index.numel() == 0 or edge_index.shape[1] == 0:
+        candidate = points.new_empty((0, points.shape[1]))
+        candidate_idx = edge_index.new_empty((2, 0))
+        return candidate, candidate_idx
+
     # Recursive call in case chunk is specified. Chunk allows limiting
     # the number of edges processed at once. This might alleviate
     # memory use

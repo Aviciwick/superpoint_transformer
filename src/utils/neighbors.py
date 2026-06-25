@@ -731,6 +731,9 @@ def cluster_radius_nn_graph(
         print(f"    cluster_radius_nn_graph | coalesce: {time() - start:0.3f} sec")
         start = time()
 
+    if edge_index.numel() == 0 or edge_index.shape[1] == 0:
+        return edge_index, distances
+
     # For each cluster pair in edge_index, compute (approximately) the
     # two closest points (coined "anchors" here). The heuristic used
     # here to find those points runs in O(E) with E the number of

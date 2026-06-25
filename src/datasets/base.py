@@ -568,9 +568,8 @@ class BaseDataset(InMemoryDataset):
     def id_to_base_id(self, id: str) -> str:
         """Given an ID, remove the tiling indications, if any.
         """
-        if self.xy_tiling is None and self.pc_tiling is None:
-            return id
-        return self.get_tile_from_path(id)[1]
+        tile = self.get_tile_from_path(id)
+        return tile[1] if tile is not None else id
 
     @property
     def cloud_ids(self) -> List[str]:
@@ -823,11 +822,12 @@ class BaseDataset(InMemoryDataset):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             start = time()
-        if self.xy_tiling is not None:
-            tile = self.get_tile_from_path(cloud_path)[0]
+        tile_info = self.get_tile_from_path(cloud_path)
+        if tile_info is not None and len(tile_info[0]) == 3:
+            tile = tile_info[0]
             data = SampleXYTiling(x=tile[0], y=tile[1], tiling=tile[2])(data)
-        elif self.pc_tiling is not None:
-            tile = self.get_tile_from_path(cloud_path)[0]
+        elif tile_info is not None and len(tile_info[0]) == 2:
+            tile = tile_info[0]
             data = SampleRecursiveMainXYAxisTiling(x=tile[0], steps=tile[1])(data)
         if verbose or src.is_debug_enabled():
             if torch.cuda.is_available():
@@ -1019,11 +1019,19 @@ class BaseDataset(InMemoryDataset):
         """
         assert smooth in [None, 'sqrt', 'log']
 
-        # Read the first NAG just to know how many levels we have in the
-        # preprocessed NAGs.
+        # Read the first NAG to identify a stable labelled level. Some
+        # datasets can contain tiles whose hierarchy stops earlier than
+        # others when cut-pursuit converges to a single component at a
+        # high level. Class weights only need semantic class counts, so
+        # level-1 histograms are preferable to assuming a uniform maximum
+        # hierarchy depth across all files.
         sample = self[0]
         sample_is_nag = isinstance(sample, NAG)
-        low = sample.end_i_level if sample_is_nag else None
+        if sample_is_nag:
+            low = 1 if sample.start_i_level <= 1 <= sample.end_i_level \
+                else sample.end_i_level
+        else:
+            low = None
 
         # Make sure the dataset has labels
         if low:
@@ -1035,8 +1043,7 @@ class BaseDataset(InMemoryDataset):
                 return None
             del sample
 
-        # To be as fast as possible, we read only the last level of each
-        # NAG, and accumulate the class counts from the label histograms
+        # Accumulate class counts from label histograms.
         counts = torch.zeros(self.num_classes)
         for i in range(len(self)):
             if self.in_memory:
@@ -1047,6 +1054,7 @@ class BaseDataset(InMemoryDataset):
                     y = NAG.load(
                         self.processed_paths[i],
                         low=low,
+                        high=low,
                         keys_low=['y'],
                         non_fp_to_long=True)[low].y
                 else:

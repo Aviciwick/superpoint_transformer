@@ -816,6 +816,14 @@ class RadiusHorizontalGraph(Transform):
             margin,
             chunk_size,
             verbose=False):
+        data = nag[i_level]
+        if data.edge_index is None or data.edge_index.numel() == 0:
+            data.edge_index = _empty_edge_index(data.pos.device)
+            data.edge_attr = _empty_horizontal_edge_attr(
+                self.keys, data.pos.device, data.pos.dtype)
+            nag._list[i_level] = data
+            return nag
+
         # Compute 'subedges', i.e. edges between level-0 points making up
         # the edges between the segments. These will be used for edge
         # features computation. NB: this operation simplifies the
@@ -841,6 +849,13 @@ class RadiusHorizontalGraph(Transform):
         # Prepare for edge feature computation
         data = nag[i_level]
         data.edge_index = edge_index
+
+        if edge_index is None or edge_index.numel() == 0:
+            data.edge_index = _empty_edge_index(data.pos.device)
+            data.edge_attr = _empty_horizontal_edge_attr(
+                self.keys, data.pos.device, data.pos.dtype)
+            nag._list[i_level] = data
+            return nag
         
         # Edge feature computation. NB: operates on trimmed graph only
         # to alleviate memory and compute. Features for all undirected
@@ -996,11 +1011,14 @@ def _horizontal_graph_by_radius_for_single_level(
     data.edge_index = None
     data.edge_attr = None
 
-    # Exit in case the i_level graph contains only one node
+    # A single superpoint has no horizontal neighbors. This is a valid
+    # degenerate graph for aggressively tiled outdoor scenes.
     if num_nodes < 2:
-        raise ValueError(
-            f"Input NAG only has 1 node at level={i_level}. Cannot compute "
-            f"radius-based horizontal graph.")
+        data.edge_index = _empty_edge_index(data.pos.device)
+        data.edge_attr = _empty_horizontal_edge_attr(
+            ['mean_off', 'std_off', 'mean_dist'], data.pos.device, data.pos.dtype)
+        nag._list[i_level] = data
+        return nag
 
     # Compute the super_index for level-0 points wrt the target level
     super_index = nag.get_super_index(i_level)
@@ -1089,6 +1107,11 @@ def _minimalistic_horizontal_edge_features(
         "Expects the graph to be trimmed, consider using " \
         "`src.utils.to_trimmed()` before computing the features"
 
+    if se is None or se.numel() == 0 or se_point_index.numel() == 0:
+        data.edge_index = _empty_edge_index(points.device)
+        data.edge_attr = _empty_horizontal_edge_attr(keys, points.device, points.dtype)
+        return data
+
     if not all(['mean_off' in keys, 'std_off' in keys, 'mean_dist' in keys]):
         raise NotImplementedError(
             "For now, 'mean_off', 'std_off' and 'mean_dist' must all be "
@@ -1154,6 +1177,35 @@ def _minimalistic_horizontal_edge_features(
     data.edge_attr = torch.cat(f, dim=1)
 
     return data
+
+
+def _empty_edge_index(device):
+    return torch.empty((2, 0), dtype=torch.long, device=device)
+
+
+def _horizontal_edge_feature_dim(keys):
+    sizes = {
+        'mean_off': 3,
+        'std_off': 3,
+        'mean_dist': 1,
+        'angle_source': 1,
+        'angle_target': 1,
+        'centroid_dir': 3,
+        'centroid_dist': 1,
+        'normal_angle': 1,
+        'log_length': 1,
+        'log_surface': 1,
+        'log_volume': 1,
+        'log_size': 1,
+    }
+    return sum(sizes.get(k, 0) for k in keys)
+
+
+def _empty_horizontal_edge_attr(keys, device, dtype=torch.float):
+    return torch.empty(
+        (0, _horizontal_edge_feature_dim(keys)),
+        dtype=dtype if torch.is_floating_point(torch.empty((), dtype=dtype)) else torch.float,
+        device=device)
 
 
 class OnTheFlyHorizontalEdgeFeatures(Transform):
@@ -1242,6 +1294,13 @@ def _on_the_fly_horizontal_edge_features(
 
     normal_key = 'mean_normal' if use_mean_normal else 'normal'
 
+    if se is None or se.numel() == 0:
+        data.edge_index = _empty_edge_index(data.pos.device)
+        for k in ['edge_attr'] + data.edge_keys:
+            data[k] = None
+        data.edge_attr = _empty_horizontal_edge_attr(keys, data.pos.device, data.pos.dtype)
+        return data
+
     assert is_trimmed(se), \
         "Expects the graph to be trimmed, consider using " \
         "`src.utils.to_trimmed()` before computing the features"
@@ -1328,24 +1387,21 @@ def _on_the_fly_horizontal_edge_features(
 
         if 'angle_source' in keys:
             normal = getattr(data, normal_key, None)
-            # Ensure se is on the same device as normal
             if se.device != normal.device:
                 se = se.to(normal.device)
-            
-            # Check if se[0] is within bounds of normal
-        if se[0].max() >= normal.shape[0]:
-             print(f"Warning: se indices max {se[0].max()} >= normal size {normal.shape[0]}. Falling back to zeros for coplanarity.")
-             f = torch.zeros(se_direction.shape[0], device=se_direction.device)
-        else:
-             # Ensure se_direction shape [N_edges, 3] and normal shape [N_nodes, 3] match at dim 0 after indexing
-             n_indexed = normal[se[0]]
-             if n_indexed.shape[0] != se_direction.shape[0]:
-                  print(f"Warning: normal[se[0]] shape {n_indexed.shape} != se_direction shape {se_direction.shape}. Using zeros.")
-                  f = torch.zeros(se_direction.shape[0], device=se_direction.device)
-             else:
-                  f = (se_direction * n_indexed).sum(dim=1).abs()
-             
-        f_list.append(torch.cat((f, f), dim=0).view(-1, 1))
+
+            if se[0].max() >= normal.shape[0]:
+                print(f"Warning: se indices max {se[0].max()} >= normal size {normal.shape[0]}. Falling back to zeros for angle_source.")
+                f = torch.zeros(se_direction.shape[0], device=se_direction.device)
+            else:
+                n_indexed = normal[se[0]]
+                if n_indexed.shape[0] != se_direction.shape[0]:
+                    print(f"Warning: normal[se[0]] shape {n_indexed.shape} != se_direction shape {se_direction.shape}. Using zeros.")
+                    f = torch.zeros(se_direction.shape[0], device=se_direction.device)
+                else:
+                    f = (se_direction * n_indexed).sum(dim=1).abs()
+
+            f_list.append(torch.cat((f, f), dim=0).view(-1, 1))
 
         if 'angle_target' in keys:
             normal = getattr(data, normal_key, None)
@@ -1613,8 +1669,10 @@ class NAGAddSelfLoops(Transform):
     def _process(self, nag):
         for i_level in range(max(nag.start_i_level, 1), nag.absolute_num_levels):
 
-            # Skip if the level has no horizontal graph
-            if not nag[i_level].has_edges:
+            # Skip if the level has no horizontal graph object. Empty
+            # edge_index tensors are still valid and should receive
+            # self-loops, e.g. a one-node level after outdoor tiling.
+            if nag[i_level].edge_index is None:
                 continue
 
             # Recover edges and attributes

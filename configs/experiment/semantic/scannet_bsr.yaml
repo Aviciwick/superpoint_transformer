@@ -1,0 +1,51 @@
+# @package _global_
+
+# to execute this experiment run:
+# python train.py experiment=semantic/scannet_bsr
+
+defaults:
+  - override /datamodule: semantic/scannet.yaml
+  - override /model: semantic/spt-2.yaml
+  - override /trainer: gpu.yaml
+
+trainer:
+  max_epochs: 1000
+
+model:
+  bsr:
+    enable: true
+    selector:
+      topk_ratio: 0.15
+      score_terms: [uncertainty, geometry, boundary]
+    refiner:
+      n_sample: 64
+      n_heads: 4
+      token_mode: superpoint_query
+      variant: mixture
+      n_subregions: 2
+      assignment_temperature: 1.0
+      sampling_mode: coverage
+      sampling_without_replacement: true
+    loss:
+      lambda_refine: 0.5
+      lambda_consistency: 0.1
+      lambda_diversity: 0.02
+      lambda_boundary: 0.05
+      global_weight: 0.5
+      warmup_epochs: 10
+      score_weighting: true
+      score_weight_gamma: 1.0
+    feedback:
+      logit_fusion_alpha: 0.5
+      warmup_epochs: 10
+  optimizer:
+    lr: 0.05
+    weight_decay: 1e-2
+
+logger:
+  wandb:
+    project: "spt_scannet"
+    name: "SPT-64-BSR"
+    group: "scannet/bsr"
+    tags: ["semantic", "scannet", "spt", "bsr"]
+    job_type: "semantic_bsr"

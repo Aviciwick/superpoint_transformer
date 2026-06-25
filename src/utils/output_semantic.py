@@ -14,9 +14,12 @@ class SemanticSegmentationOutput:
     (if any).
     """
 
-    def __init__(self, logits, y_hist=None):
+    def __init__(self, logits, y_hist=None, point_logits=None, point_y=None, super_index=None):
         self.logits = logits
         self.y_hist = y_hist
+        self.point_logits = point_logits
+        self.point_y = point_y
+        self.super_index = super_index
         if src.is_debug_enabled():
             self.debug()
 
@@ -82,6 +85,23 @@ class SemanticSegmentationOutput:
         logits = self.logits[0] if self.multi_stage else self.logits
         return torch.argmax(logits, dim=1)
 
+    def point_semantic_pred(self, super_index=None):
+        """Semantic predictions on level-0 points.
+
+        Prefer explicit point logits when present; otherwise scatter the
+        level-1 superpoint prediction through `super_index`.
+        """
+        if self.point_logits is not None:
+            return torch.argmax(self.point_logits, dim=1)
+        if super_index is None:
+            super_index = self.super_index
+        assert super_index is not None, "Must provide super_index for point-level prediction"
+        return self.semantic_pred()[super_index]
+
+    @property
+    def has_point_target(self):
+        return self.point_y is not None
+
     @property
     def semantic_target(self):
         """Semantic target on the level-1 superpoint.
@@ -134,6 +154,8 @@ class SemanticSegmentationOutput:
             super_index = sub.to_super_index()
         
         # Distribute the level-1 superpoint predictions to the voxels
+        if self.point_logits is not None:
+            return self.point_semantic_pred()
         return self.semantic_pred()[super_index]
 
     def full_res_semantic_pred(

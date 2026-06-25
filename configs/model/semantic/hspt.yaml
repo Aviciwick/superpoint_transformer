@@ -1,6 +1,7 @@
 # @package model
-# H-SPT (Hybrid SuperPoint Transformer) 模块配置
-# 在 spt.yaml 的 defaults 中引入: - /model/semantic/hspt
+# LEGACY ONLY: H-SPT (Hybrid SuperPoint Transformer) 模块配置
+# 当前语义分割主路径已经固定为 SPT baseline / BSR-SPT。
+# 本配置文件仅为旧 checkpoint 或历史对照保留，不再接入当前论文主训练与主推理流程。
 
 hspt:
   # 是否启用 H-SPT 模块
